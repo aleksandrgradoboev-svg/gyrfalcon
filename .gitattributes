@@ -1,0 +1,14 @@
+# Единый перевод строки в репозитории: LF.
+# Иначе CRLF из Windows против LF в Linux-CI даёт ложные срабатывания
+# cargo fmt и шум в diff на пустом месте.
+* text=auto eol=lf
+
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+
+# Двоичное — не трогать.
+*.png     binary
+*.db      binary
+*.hbk     binary

@@ -1,0 +1,21 @@
+[package]
+name = "gyrfalcon-parser"
+description = "Разбор BSL и XML-выгрузки конфигураций 1С"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tree-sitter = "0.25"
+rayon.workspace = true
+walkdir.workspace = true
+
+[build-dependencies]
+cc = "1"
