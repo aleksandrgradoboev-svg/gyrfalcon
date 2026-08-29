@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/aleksandrgradoboev-svg/gyrfalcon/releases/latest"><img src="https://img.shields.io/github/v/release/aleksandrgradoboev-svg/gyrfalcon?color=blue" alt="Релиз"></a>
   <img src="https://img.shields.io/badge/Rust-stable-dea584?logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/тестов-250-brightgreen" alt="Тесты">
   <img src="https://img.shields.io/badge/харнессов-3-purple" alt="Харнессы">
@@ -65,6 +66,9 @@ MCP, три харнесса из коробки. Ни рантайма, ни о
 разрешимого: «не сумели разрешить» отличимо от «разрешать нечего».
 
 ## Быстрый старт
+
+**Скачать готовый бинарь** — [релизы](https://github.com/aleksandrgradoboev-svg/gyrfalcon/releases/latest).
+Один файл, больше ничего не нужно: ни Rust, ни Python, ни Docker, ни ключа API.
 
 ```bash
 # собрать индекс по выгрузке конфигурации
