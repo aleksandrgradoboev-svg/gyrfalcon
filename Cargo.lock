@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "gyrfalcon-index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "gyrfalcon-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "gyrfalcon-index",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "gyrfalcon-parser"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "cc",
