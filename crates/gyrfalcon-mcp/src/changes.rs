@@ -123,7 +123,9 @@ fn git(корень: &PathBuf, аргументы: &[&str]) -> Result<String, St
 }
 
 /// Изменённые файлы из трёх источников — объединением, как у образца.
-fn изменённые_файлы(корень: &PathBuf, база: &str) -> Result<Vec<String>, String> {
+fn изменённые_файлы(
+    корень: &PathBuf, база: &str
+) -> Result<Vec<String>, String> {
     let mut набор: BTreeMap<String, ()> = BTreeMap::new();
 
     // 1. закоммиченное против базы; трёхточие = от точки расхождения,
@@ -237,10 +239,12 @@ pub fn detect_changes(conn: &Connection, args: &Value) -> Result<Value, String> 
             )
             .map_err(|e| e.to_string())?;
         let строки = st
-            .query_map([&хвост], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .query_map([&хвост], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?;
-        for с in строки.flatten() {
-            семена.push(с);
+        for пара in строки.flatten() {
+            семена.push(пара);
         }
     }
 
@@ -264,10 +268,8 @@ pub fn detect_changes(conn: &Connection, args: &Value) -> Result<Value, String> 
     let п_глубина = имена.len() + 1;
     let п_предел = имена.len() + 2;
 
-    let mut параметры: Vec<&dyn rusqlite::ToSql> = имена
-        .iter()
-        .map(|s| s as &dyn rusqlite::ToSql)
-        .collect();
+    let mut параметры: Vec<&dyn rusqlite::ToSql> =
+        имена.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let mut параметры_сводки = параметры.clone();
     параметры_сводки.push(&глубина);
     параметры.push(&глубина);
@@ -350,9 +352,7 @@ pub fn detect_changes(conn: &Connection, args: &Value) -> Result<Value, String> 
     // Считаем по именам семян: если изменённый метод кем-то перехвачен,
     // в боевой базе исполнится не то, что видно в diff.
     if let Ok(мера) = conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM extension_overrides WHERE method_name IN ({список})"
-        ),
+        &format!("SELECT COUNT(*) FROM extension_overrides WHERE method_name IN ({список})"),
         rusqlite::params_from_iter(имена.iter()),
         |r| r.get::<_, i64>(0),
     ) {
@@ -392,8 +392,8 @@ fn радиус_с_риском(
         .map_err(|e| e.to_string())?;
     let mut сводка: BTreeMap<&str, i64> = BTreeMap::new();
     let mut всего = 0i64;
-    for с in строки_св.flatten() {
-        let (hop, сколько) = с;
+    for запись in строки_св.flatten() {
+        let (hop, сколько) = запись;
         *сводка.entry(риск(hop)).or_insert(0) += сколько;
         всего += сколько;
     }
@@ -410,8 +410,8 @@ fn радиус_с_риском(
         .map_err(|e| e.to_string())?;
 
     let mut набор = Vec::new();
-    for с in строки.flatten() {
-        let (имя, hop, путь) = с;
+    for запись in строки.flatten() {
+        let (имя, hop, путь) = запись;
         набор.push(json!([имя, hop, риск(hop), путь]));
     }
     let срезано = всего > набор.len() as i64;
@@ -505,7 +505,10 @@ mod tests {
         assert_eq!(r["total"], 3, "сводка обязана считать весь радиус");
         assert_eq!(r["shown"], 1, "список режется пределом");
         assert_eq!(r["by_risk"]["CRITICAL"], 3);
-        assert!(r["note"].is_string(), "срез списка должен быть назван вслух");
+        assert!(
+            r["note"].is_string(),
+            "срез списка должен быть назван вслух"
+        );
     }
 
     /// Ведущий дефис в ref — внятный отказ, а не `unknown option` от git.
