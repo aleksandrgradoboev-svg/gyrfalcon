@@ -87,6 +87,9 @@ pub const SKILL: &str = concat!(
     "| **Какие конфигурации знает сервер? Что писать в `project`?** | `list_projects()` |
 ",
     "| Влияние правки (транзитивно) | `callers(method, direction=\"in\", depth=3)` |\n",
+    "| **Что сломает этот MR / мои правки?** | `detect_changes()` — diff → задетые методы → риск |
+",
+    "| Влияние правки против ветки | `detect_changes(base_branch=\"main\", depth=3)` |\n",
     "| Показать тело процедуры | `read(method, module)` |\n",
     "| Ищу текст, которого нет в именах: GUID, сообщение, кусок запроса | `grep(pattern, module)` |
 ",
@@ -343,6 +346,7 @@ impl Tier {
                 "read",
                 "overrides",
                 "movements",
+                "detect_changes",
                 "schema",
                 "coverage",
                 "grep",
@@ -356,6 +360,7 @@ impl Tier {
                 "read",
                 "overrides",
                 "movements",
+                "detect_changes",
                 "schema",
                 "coverage",
                 "sql",

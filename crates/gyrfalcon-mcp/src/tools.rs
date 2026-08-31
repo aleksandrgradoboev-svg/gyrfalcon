@@ -57,6 +57,7 @@ impl Profile {
             "read",
             "overrides",
             "movements",
+            "detect_changes",
             "schema",
             "coverage",
             "grep",
@@ -142,6 +143,14 @@ pub const TOOLS: &[Tool] = &[
              Берётся из ОБЪЯВЛЕННЫХ движений метаданных, а не только из кода — поэтому \
              видит и то, что пишется подписками и общими модулями.",
         schema: schema_movements,
+    },
+    Tool {
+        name: "detect_changes",
+        description: "Что сломает эта правка: git diff → изменённые методы → радиус поражения \
+             с оценкой риска по расстоянию (hop 1 — CRITICAL, дальше убывает). Видит и \
+             закоммиченное против базы, и рабочее дерево, и новые файлы. Отвечает на вопрос \
+             ревьюера одним вызовом вместо обхода вызывающих руками.",
+        schema: schema_detect_changes,
     },
     Tool {
         name: "schema",
@@ -268,6 +277,27 @@ fn schema_callers() -> Value {
     )
 }
 
+fn schema_detect_changes() -> Value {
+    обяз(
+        json!({
+            "base_branch": {"type": "string", "default": "main", "description":
+                "Ветка сравнения. Диапазон трёхточечный (base...HEAD) — от точки \
+                 расхождения, поэтому чужие правки, приехавшие в base после ветвления, \
+                 в выдачу не попадают"},
+            "since": {"type": "string", "description":
+                "Ссылка вместо ветки: HEAD~10, тег, коммит. Имеет приоритет над base_branch"},
+            "direction": {"type": "string", "enum": ["inbound", "outbound", "both"],
+                "default": "inbound", "description":
+                "inbound — радиус поражения (кого заденет правка); outbound — от чего она зависит"},
+            "depth": {"type": "integer", "default": 2, "description": "Глубина обхода, 1-5"},
+            "scope": {"type": "string", "enum": ["files", "symbols"], "default": "symbols",
+                "description": "files — только перечень изменённых файлов, без обхода графа"},
+            "limit": {"type": "integer", "default": 200}
+        }),
+        &[],
+    )
+}
+
 fn schema_read() -> Value {
     обяз(
         json!({
@@ -360,6 +390,7 @@ pub fn call(
         "schema" => схема(conn, args),
         "coverage" => coverage(conn),
         "grep" => crate::grep::grep(conn, args),
+        "detect_changes" => crate::changes::detect_changes(conn, args),
         "sql" => {
             let q = строка(args, "query").ok_or("нужен параметр query")?;
             let lim = число(args, "limit").unwrap_or(sql::DEFAULT_LIMIT as i64) as usize;
