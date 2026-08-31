@@ -6,6 +6,7 @@
 //! девятью инструментами и профилями под роль (Р-101, Р-104). Плюс прежние
 //! команды сборки и замера.
 
+mod autoupdate;
 mod changes;
 mod freshness_guard;
 mod grep;
@@ -87,6 +88,7 @@ fn print_help() {
 
 Команды:
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
+                      [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
                       MCP-сервер на stdio (для клиента вроде Claude Code)
   ui --db <файл.db> [--port 8787]
                       визуальная карта: движения, подсистемы, расширения
@@ -373,6 +375,9 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let mut db: Option<PathBuf> = None;
     let mut index_dir: Option<PathBuf> = None;
     let mut profile = tools::Profile::All;
+    // Выключена по умолчанию — как auto_index у образца: сборка трогает
+    // файл, которым сервер отвечает, и включать её за человека нельзя.
+    let mut auto_update = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -392,12 +397,14 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                 profile = tools::Profile::parse(v)
                     .ok_or_else(|| format!("неизвестный профиль '{v}': all | analysis | scout"))?;
             }
+            "--auto-update" => auto_update = true,
             other => return Err(format!("неизвестный параметр: {other}")),
         }
         i += 1;
     }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
     server::Server::new(источник, profile)
+        .с_автодосборкой(auto_update)
         .run()
         .map_err(|e| e.to_string())
 }
