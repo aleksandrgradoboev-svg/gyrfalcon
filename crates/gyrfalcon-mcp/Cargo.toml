@@ -8,6 +8,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+name = "gyrfalcon_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gyrfalcon"
 path = "src/main.rs"

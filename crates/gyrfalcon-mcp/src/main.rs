@@ -6,19 +6,7 @@
 //! девятью инструментами и профилями под роль (Р-101, Р-104). Плюс прежние
 //! команды сборки и замера.
 
-mod autoupdate;
-mod changes;
-mod freshness_guard;
-mod grep;
-mod hooks;
-mod http;
-mod install;
-mod proto;
-mod registry;
-mod server;
-mod sql;
-mod tools;
-mod ui;
+use gyrfalcon_mcp::{hooks, http, install, registry, server, tools};
 
 use gyrfalcon_index::schema;
 use gyrfalcon_parser::scan;
