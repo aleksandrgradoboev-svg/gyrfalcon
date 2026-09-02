@@ -90,7 +90,8 @@ fn print_help() {
 Команды:
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
                       [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
-                      [--http [--port 8788]]  транспорт Streamable HTTP вместо stdio
+                      [--http [--port 8788] [--bind 127.0.0.1]]
+                                       транспорт Streamable HTTP вместо stdio
                       MCP-сервер (по умолчанию stdio — для клиента вроде Claude Code)
   ui --db <файл.db> [--port 8787]
                       визуальная карта: движения, подсистемы, расширения
@@ -384,6 +385,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     // `--port` без `--http` не молчал, а был назван ошибкой.
     let mut http = false;
     let mut port: Option<u16> = None;
+    let mut bind: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -414,20 +416,37 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                         .map_err(|_| "--port: не число")?,
                 );
             }
+            "--bind" => {
+                i += 1;
+                bind = Some(args.get(i).ok_or("--bind без значения")?.clone());
+            }
             other => return Err(format!("неизвестный параметр: {other}")),
         }
         i += 1;
     }
+    // Молча проглотить эти флаги значило бы соврать: человек их задал,
+    // а слушать никто не начнёт.
     if port.is_some() && !http {
         return Err("--port без --http: транспорт stdio порта не слушает. \
              Нужен HTTP — добавьте --http"
             .into());
     }
+    if bind.is_some() && !http {
+        return Err(
+            "--bind без --http: транспорт stdio интерфейсов не слушает. \
+             Нужен HTTP — добавьте --http"
+                .into(),
+        );
+    }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
     let mut сервер =
         server::Server::new(источник, profile).с_автодосборкой(auto_update);
     if http {
-        mcp_http::serve(сервер, port.unwrap_or(mcp_http::ПОРТ))
+        mcp_http::serve(
+            сервер,
+            bind.as_deref().unwrap_or(mcp_http::ПЕТЛЯ),
+            port.unwrap_or(mcp_http::ПОРТ),
+        )
     } else {
         сервер.run().map_err(|e| e.to_string())
     }
