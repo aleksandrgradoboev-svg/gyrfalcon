@@ -74,3 +74,8 @@ docs/acceptance.md
 __pycache__/
 *.pyc
 tools/acceptance/last-run.json
+
+# Каталоги умолчаний compose: их создаёт первый `docker compose up`, и
+# содержимое — чужие индексы и выгрузки, а не исходники проекта.
+/index/
+/src-1c/
