@@ -41,6 +41,16 @@ RUN useradd --system --uid 10001 --user-group --create-home gyrfalcon
 
 COPY --from=build /gyrfalcon /usr/local/bin/gyrfalcon
 
+# Словарь семантики едет внутрь образа: он нужен каждой сборке индекса, и
+# без него `find` теряет семантический сигнал. Путь фиксирован, чтобы
+# команда сборки не зависела от того, куда его положил человек:
+#
+#   build /src --out /data/config.db --dict /usr/share/gyrfalcon/dictionary.db
+#
+# 40 МБ к образу — цена того, что сборка работает из коробки, а не после
+# отдельного монтирования, о котором надо помнить.
+COPY data/dictionary-all-configs.db /usr/share/gyrfalcon/dictionary.db
+
 USER 10001:10001
 WORKDIR /data
 EXPOSE 8788
