@@ -13,6 +13,7 @@ mod grep;
 mod hooks;
 mod http;
 mod install;
+mod mcp_http;
 mod proto;
 mod registry;
 mod server;
@@ -89,7 +90,8 @@ fn print_help() {
 Команды:
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
                       [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
-                      MCP-сервер на stdio (для клиента вроде Claude Code)
+                      [--http [--port 8788]]  транспорт Streamable HTTP вместо stdio
+                      MCP-сервер (по умолчанию stdio — для клиента вроде Claude Code)
   ui --db <файл.db> [--port 8787]
                       визуальная карта: движения, подсистемы, расширения
   install [--harness claude|kilo|codex] [--db <файл>] [--plan] [--force]
@@ -378,6 +380,10 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     // Выключена по умолчанию — как auto_index у образца: сборка трогает
     // файл, которым сервер отвечает, и включать её за человека нельзя.
     let mut auto_update = false;
+    // Транспорт: stdio, пока не сказано иное. Порт отдельно от флага, чтобы
+    // `--port` без `--http` не молчал, а был назван ошибкой.
+    let mut http = false;
+    let mut port: Option<u16> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -398,15 +404,33 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("неизвестный профиль '{v}': all | analysis | scout"))?;
             }
             "--auto-update" => auto_update = true,
+            "--http" => http = true,
+            "--port" => {
+                i += 1;
+                port = Some(
+                    args.get(i)
+                        .ok_or("--port без значения")?
+                        .parse()
+                        .map_err(|_| "--port: не число")?,
+                );
+            }
             other => return Err(format!("неизвестный параметр: {other}")),
         }
         i += 1;
     }
+    if port.is_some() && !http {
+        return Err("--port без --http: транспорт stdio порта не слушает. \
+             Нужен HTTP — добавьте --http"
+            .into());
+    }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
-    server::Server::new(источник, profile)
-        .с_автодосборкой(auto_update)
-        .run()
-        .map_err(|e| e.to_string())
+    let mut сервер =
+        server::Server::new(источник, profile).с_автодосборкой(auto_update);
+    if http {
+        mcp_http::serve(сервер, port.unwrap_or(mcp_http::ПОРТ))
+    } else {
+        сервер.run().map_err(|e| e.to_string())
+    }
 }
 
 /// Инкрементальная пересборка: догнать индекс, не собирая заново.

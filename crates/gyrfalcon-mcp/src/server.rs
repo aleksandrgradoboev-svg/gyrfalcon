@@ -120,10 +120,17 @@ impl Server {
         let id = req.id.clone()?;
 
         match req.method.as_str() {
-            "initialize" => Some(proto::ok(
-                id,
-                proto::initialize_result("gyrfalcon", env!("CARGO_PKG_VERSION")),
-            )),
+            "initialize" => {
+                // Версию диктует клиент, а не транспорт: по stdio приходят
+                // 2024-11-05, по HTTP — 2025-03-26 и новее.
+                let протокол = proto::согласовать_версию(
+                    req.params.get("protocolVersion").and_then(Value::as_str),
+                );
+                Some(proto::ok(
+                    id,
+                    proto::initialize_result("gyrfalcon", env!("CARGO_PKG_VERSION"), протокол),
+                ))
+            }
             "ping" => Some(proto::ok(id, json!({}))),
             "tools/list" => {
                 let список: Vec<Value> = tools::list(self.profile)
@@ -504,7 +511,7 @@ impl Server {
         })
     }
 
-    fn описание_источника(&self) -> String {
+    pub fn описание_источника(&self) -> String {
         match &self.источник {
             crate::registry::Источник::Один { путь, .. } => {
                 путь.display().to_string()
@@ -584,6 +591,20 @@ mod tests {
             .unwrap();
         assert_eq!(r["result"]["serverInfo"]["name"], "gyrfalcon");
         assert_eq!(r["result"]["protocolVersion"], proto::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn отвечает_версией_клиента_когда_она_знакома() {
+        // Клиент Streamable HTTP представляется 2025-03-26. Ответить ему
+        // версией stdio значило бы разойтись с ним на первом же сообщении.
+        let mut s = сервер();
+        let r = s
+            .handle(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize",
+                    "params":{"protocolVersion":"2025-03-26"}}"#,
+            )
+            .unwrap();
+        assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
     }
 
     #[test]
