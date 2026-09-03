@@ -26,6 +26,3 @@ docs/
 # rustup выкачивать вторую копию stable вместе с rustfmt и clippy —
 # компонентами, которые сборке не нужны вовсе.
 rust-toolchain.toml
-
-/index/
-/src-1c/
