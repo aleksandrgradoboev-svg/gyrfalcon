@@ -12,6 +12,7 @@ pub mod grep;
 pub mod hooks;
 pub mod http;
 pub mod install;
+pub mod mcp_http;
 pub mod proto;
 pub mod registry;
 pub mod server;
