@@ -756,8 +756,12 @@ mod tests {
             .unwrap();
         for t in r["result"]["tools"].as_array().unwrap() {
             let имя = t["name"].as_str().unwrap();
-            if имя == "list_projects" {
-                continue; // ему проект не нужен по определению
+            // Исключения — те, кто к индексу не обращается вовсе:
+            // `list_projects` отвечает про реестр серверов, а `check_bsl`
+            // разбирает поданный текст. Спрашивать у них проект незачем, и
+            // лишний обязательный параметр слабая модель заполнит наугад.
+            if имя == "list_projects" || имя == "check_bsl" {
+                continue;
             }
             assert!(
                 t["inputSchema"]["properties"]["project"].is_object(),
