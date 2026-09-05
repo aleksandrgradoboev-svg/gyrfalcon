@@ -72,11 +72,7 @@ pub fn check_names(conn: &Connection, args: &Value) -> Result<Value, String> {
     // обращение к справочнику — замер 05.09.2026 дал 1,14% ложных тревог,
     // и ВСЕ до единой были именно такими.
     let предопр = предопределённые(conn)?;
-    let локальные: HashSet<String> = parsed
-        .locals
-        .iter()
-        .map(|s| s.to_lowercase())
-        .collect();
+    let локальные: HashSet<String> = parsed.locals.iter().map(|s| s.to_lowercase()).collect();
     // Методы, объявленные в самом проверяемом тексте: они законны и в индексе
     // отсутствуют — модуль ещё не записан и не проиндексирован.
     let свои: HashSet<String> = parsed
@@ -97,7 +93,8 @@ pub fn check_names(conn: &Connection, args: &Value) -> Result<Value, String> {
             continue;
         };
         let низ = qual.to_lowercase();
-        if локальные.contains(&низ) || предопр.contains(&низ) || !модули.contains(&низ) {
+        if локальные.contains(&низ) || предопр.contains(&низ) || !модули.contains(&низ)
+        {
             // Либо это локальное имя (переменная, параметр, счётчик цикла),
             // либо квалификатор вовсе не объект конфигурации. В обоих случаях
             // индекс про него ничего не знает, и «не найдено» было бы ложью.
@@ -227,7 +224,10 @@ fn предопределённые(conn: &Connection) -> Result<HashSet<String>
 /// первая версия спрашивала индекс дважды за промах (существование + похожие),
 /// и живой прогон дал **1 модуль в секунду** — при 477 у `check_bsl`. Разница
 /// не в SQLite, а в числе обращений: у модуля с сотней вызовов их было двести.
-fn методы_объекта(conn: &Connection, qual: &str) -> Result<HashMap<String, String>, String> {
+fn методы_объекта(
+    conn: &Connection,
+    qual: &str,
+) -> Result<HashMap<String, String>, String> {
     let mut st = conn
         .prepare(
             // COLLATE NOCASE, а не LOWER(): к результату функции SQLite не
@@ -240,7 +240,10 @@ fn методы_объекта(conn: &Connection, qual: &str) -> Result<HashMap<
         .map_err(|e| e.to_string())?;
     let rows = st
         .query_map([qual], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1).unwrap_or_default()))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1).unwrap_or_default(),
+            ))
         })
         .map_err(|e| e.to_string())?;
     let mut out = HashMap::new();
