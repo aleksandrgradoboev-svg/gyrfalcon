@@ -53,6 +53,7 @@ impl Profile {
             "list_projects",
             "find",
             "object",
+            "assist_bsl",
             "callers",
             "read",
             "overrides",
@@ -74,6 +75,7 @@ impl Profile {
             "list_projects",
             "find",
             "object",
+            "assist_bsl",
             "read",
             "schema",
             "coverage",
@@ -123,6 +125,11 @@ pub const TOOLS: &[Tool] = &[
              табличные части, синонимы, предопределённые, формы, движения по регистрам. \
              Собирается из нескольких таблиц за один вызов — не нужно спрашивать по частям.",
         schema: schema_object,
+    },
+    Tool {
+        name: "assist_bsl",
+        description: "Помочь НАПИСАТЬ BSL, а не только проверить готовое: по задаче              подобрать реальные методы, объекты и реквизиты конфигурации, показать              короткие места вызова, дать дополнения в позиции курсора и безопасный              каркас. Непустой черновик заодно проходит check_bsl. Выдача строгая:              слабые совпадения отбрасываются, reference_only нельзя копировать как              внешний вызов. Текст запросов 1С проверяется отдельно.",
+        schema: crate::assist_bsl::schema,
     },
     Tool {
         name: "callers",
@@ -395,6 +402,7 @@ pub fn call(
     match name {
         "find" => find(conn, args),
         "object" => object(conn, args),
+        "assist_bsl" => crate::assist_bsl::assist_bsl(conn, args),
         "callers" => callers(conn, args),
         "read" => read(conn, args),
         "overrides" => overrides(conn, args),

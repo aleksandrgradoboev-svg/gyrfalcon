@@ -5,6 +5,7 @@
 //! напрямую из другого приложения — без stdio/JSON-RPC обвязки (`server`,
 //! `proto`, `http`), когда она не нужна вызывающей стороне.
 
+pub mod assist_bsl;
 pub mod autoupdate;
 pub mod changes;
 pub mod check_bsl;
@@ -14,6 +15,7 @@ pub mod hooks;
 pub mod http;
 pub mod install;
 pub mod mcp_http;
+pub mod platform_help;
 pub mod proto;
 pub mod registry;
 pub mod server;

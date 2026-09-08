@@ -4,7 +4,7 @@
 
 ```bash
 cargo build --release          # бинарь: target/release/gyrfalcon
-cargo test --workspace         # 199 тестов
+cargo test --workspace         # 311 тестов
 cargo fmt --all -- --check     # форматирование
 cargo clippy --workspace --all-targets -- -D warnings
 ```
