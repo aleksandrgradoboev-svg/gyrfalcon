@@ -29,3 +29,4 @@ regex.workspace = true
 notify.workspace = true
 walkdir.workspace = true
 zip.workspace = true
+sha2.workspace = true

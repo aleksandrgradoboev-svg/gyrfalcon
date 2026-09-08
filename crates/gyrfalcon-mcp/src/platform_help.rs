@@ -6,17 +6,22 @@
 //! и слабые «лучшие из плохих» совпадения не возвращаются.
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::{Cursor, Read};
+use std::fs;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SECTION: usize = 800;
 const MIN_TERM_MATCHES: usize = 2;
 const TARGET_SCORE_WINDOW: usize = 20;
+const CACHE_SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Item {
     title: String,
     owner: String,
@@ -33,6 +38,28 @@ struct Item {
 struct Catalog {
     source: PathBuf,
     version: String,
+    items: Vec<Item>,
+    cache_path: PathBuf,
+    cache_hit: bool,
+    cache_bytes: u64,
+    source_bytes: u64,
+    load_ms: u128,
+    cache_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceIdentity {
+    schema: u32,
+    path: String,
+    version: String,
+    size: u64,
+    modified_ns: u128,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachePayload {
+    identity: SourceIdentity,
     items: Vec<Item>,
 }
 
@@ -183,6 +210,14 @@ pub fn suggest(task: &str, source: &str, cursor: Option<&Value>, limit: usize) -
         "available": true,
         "version": catalog.version,
         "source": catalog.source,
+        "cache": {
+            "hit": catalog.cache_hit,
+            "path": catalog.cache_path,
+            "source_bytes": catalog.source_bytes,
+            "compressed_bytes": catalog.cache_bytes,
+            "load_ms": catalog.load_ms,
+            "warning": catalog.cache_warning,
+        },
         "target_owners": target_owner_list,
         "catalog_items": catalog.items.len(),
         "catalog_by_kind": {
@@ -259,6 +294,7 @@ fn select_target_owners<'a>(
 }
 
 fn load_catalog() -> Result<Catalog, String> {
+    let started = Instant::now();
     let source = locate_hbk().ok_or(
         "не найден shcntx_ru.hbk; задайте GYRFALCON_PLATFORM_BIN каталогом bin установленной платформы 1С",
     )?;
@@ -269,36 +305,164 @@ fn load_catalog() -> Result<Catalog, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let bytes =
-        std::fs::read(&source).map_err(|e| format!("не прочитан {}: {e}", source.display()))?;
-    let storage = extract_entity(&bytes, "FileStorage")?;
-    let mut zip = zip::ZipArchive::new(Cursor::new(storage))
-        .map_err(|e| format!("FileStorage в {} не является ZIP: {e}", source.display()))?;
-    let mut items = Vec::new();
-    for index in 0..zip.len() {
-        let mut file = zip.by_index(index).map_err(|e| e.to_string())?;
-        let path = file.name().replace('\\', "/");
-        if !path.ends_with(".html") || !interesting_path(&path) {
-            continue;
+    let bytes = fs::read(&source).map_err(|e| format!("не прочитан {}: {e}", source.display()))?;
+    let identity = source_identity(&source, &version, &bytes)?;
+    let cache_path = cache_file_path(&identity);
+    let (items, cache_hit, cache_warning) = load_or_create_cache(&cache_path, &identity, || {
+        let storage = extract_entity(&bytes, "FileStorage")?;
+        let mut zip = zip::ZipArchive::new(Cursor::new(storage))
+            .map_err(|e| format!("FileStorage в {} не является ZIP: {e}", source.display()))?;
+        let mut items = Vec::new();
+        for index in 0..zip.len() {
+            let mut file = zip.by_index(index).map_err(|e| e.to_string())?;
+            let path = file.name().replace('\\', "/");
+            if !path.ends_with(".html") || !interesting_path(&path) {
+                continue;
+            }
+            let mut html = String::new();
+            file.read_to_string(&mut html)
+                .map_err(|e| format!("не прочитана страница {path}: {e}"))?;
+            if let Some(item) = parse_page(&path, &html) {
+                items.push(item);
+            }
         }
-        let mut html = String::new();
-        file.read_to_string(&mut html)
-            .map_err(|e| format!("не прочитана страница {path}: {e}"))?;
-        if let Some(item) = parse_page(&path, &html) {
-            items.push(item);
+        if items.is_empty() {
+            return Err(format!(
+                "в {} не найдено ни одной страницы API",
+                source.display()
+            ));
         }
-    }
-    if items.is_empty() {
-        return Err(format!(
-            "в {} не найдено ни одной страницы API",
-            source.display()
-        ));
-    }
+        Ok(items)
+    })?;
     Ok(Catalog {
         source,
         version,
         items,
+        cache_bytes: fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0),
+        cache_path,
+        cache_hit,
+        source_bytes: bytes.len() as u64,
+        load_ms: started.elapsed().as_millis(),
+        cache_warning,
     })
+}
+
+fn source_identity(source: &Path, version: &str, bytes: &[u8]) -> Result<SourceIdentity, String> {
+    let metadata = fs::metadata(source)
+        .map_err(|e| format!("не прочитаны свойства {}: {e}", source.display()))?;
+    let canonical = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    let modified_ns = metadata
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(SourceIdentity {
+        schema: CACHE_SCHEMA,
+        path: canonical.to_string_lossy().to_string(),
+        version: version.to_string(),
+        size: metadata.len(),
+        modified_ns,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
+fn cache_file_path(identity: &SourceIdentity) -> PathBuf {
+    let path_hash = format!("{:x}", Sha256::digest(identity.path.as_bytes()));
+    let name = format!(
+        "platform-help-v{}-{}-{}.zip",
+        CACHE_SCHEMA,
+        &path_hash[..16],
+        &identity.sha256[..16]
+    );
+    cache_dir().join(name)
+}
+
+fn cache_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("GYRFALCON_CACHE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(path).join("Gyrfalcon").join("cache");
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("gyrfalcon");
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path).join(".cache").join("gyrfalcon");
+    }
+    std::env::temp_dir().join("gyrfalcon-cache")
+}
+
+fn read_cache(path: &Path, identity: &SourceIdentity) -> Result<Vec<Item>, String> {
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let entry = zip.by_name("catalog.json").map_err(|e| e.to_string())?;
+    let payload: CachePayload = serde_json::from_reader(entry).map_err(|e| e.to_string())?;
+    if payload.identity != *identity {
+        return Err("отпечаток справки изменился".to_string());
+    }
+    if payload.items.is_empty() {
+        return Err("кэш справки пуст".to_string());
+    }
+    Ok(payload.items)
+}
+
+fn load_or_create_cache<F>(
+    path: &Path,
+    identity: &SourceIdentity,
+    create: F,
+) -> Result<(Vec<Item>, bool, Option<String>), String>
+where
+    F: FnOnce() -> Result<Vec<Item>, String>,
+{
+    if let Ok(items) = read_cache(path, identity) {
+        return Ok((items, true, None));
+    }
+    let items = create()?;
+    let warning = write_cache(path, identity, &items).err();
+    Ok((items, false, warning))
+}
+
+fn write_cache(path: &Path, identity: &SourceIdentity, items: &[Item]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("у пути кэша нет родительского каталога")?;
+    fs::create_dir_all(parent).map_err(|e| format!("не создан каталог кэша: {e}"))?;
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("catalog.json", options)
+        .map_err(|e| format!("не начат кэш справки: {e}"))?;
+    let payload = CachePayload {
+        identity: identity.clone(),
+        items: items.to_vec(),
+    };
+    serde_json::to_writer(&mut zip, &payload)
+        .map_err(|e| format!("не записан кэш справки: {e}"))?;
+    zip.flush()
+        .map_err(|e| format!("не сброшен кэш справки: {e}"))?;
+    let data = zip
+        .finish()
+        .map_err(|e| format!("не завершён кэш справки: {e}"))?
+        .into_inner();
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temporary, data).map_err(|e| format!("не записан временный кэш: {e}"))?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(_) if read_cache(path, identity).is_ok() => {
+            let _ = fs::remove_file(&temporary);
+            Ok(())
+        }
+        Err(first) => {
+            let _ = fs::remove_file(path);
+            fs::rename(&temporary, path)
+                .map_err(|second| format!("не установлен кэш справки: {first}; повтор: {second}"))
+        }
+    }
 }
 
 fn interesting_path(path: &str) -> bool {
@@ -646,6 +810,84 @@ mod tests {
             selected,
             HashSet::from(["коллекцияэлементовструктурыдиаграммыкомпоновкиданных".to_string()])
         );
+    }
+
+    fn cache_fixture(name: &str) -> (PathBuf, SourceIdentity, Item) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "gyrfalcon-cache-test-{}-{name}-{unique}",
+            std::process::id(),
+        ));
+        let path = directory.join("catalog.zip");
+        let identity = SourceIdentity {
+            schema: CACHE_SCHEMA,
+            path: "C:/Program Files/1cv8/8.3.27/bin/shcntx_ru.hbk".to_string(),
+            version: "8.3.27".to_string(),
+            size: 40_000_000,
+            modified_ns: 123,
+            sha256: "a".repeat(64),
+        };
+        let item = parse_page(
+            "objects/Structure/methods/Insert.html",
+            r#"<h1 class="V8SH_pagetitle">Структура.Вставить</h1>
+               <p class="V8SH_chapter">Синтаксис:</p>Вставить(&lt;Ключ&gt;)"#,
+        )
+        .unwrap();
+        (path, identity, item)
+    }
+
+    #[test]
+    fn cold_cache_is_created() {
+        let (path, identity, item) = cache_fixture("cold");
+        let (items, hit, warning) =
+            load_or_create_cache(&path, &identity, || Ok(vec![item])).unwrap();
+
+        assert!(!hit);
+        assert!(warning.is_none());
+        assert_eq!(items.len(), 1);
+        assert!(path.is_file());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn warm_cache_is_loaded_without_rebuilding() {
+        let (path, identity, item) = cache_fixture("warm");
+        write_cache(&path, &identity, &[item]).unwrap();
+        let (items, hit, warning) = load_or_create_cache(&path, &identity, || {
+            Err("тёплый кэш не должен вызывать сборщик".to_string())
+        })
+        .unwrap();
+
+        assert!(hit);
+        assert!(warning.is_none());
+        assert_eq!(items.len(), 1);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn changed_source_identity_invalidates_cache() {
+        let (path, identity, item) = cache_fixture("invalidate");
+        write_cache(&path, &identity, std::slice::from_ref(&item)).unwrap();
+
+        let mut changed = identity.clone();
+        changed.version = "8.3.28".to_string();
+        let (_, hit, warning) = load_or_create_cache(&path, &changed, || Ok(vec![item])).unwrap();
+        assert!(!hit);
+        assert!(warning.is_none());
+        assert!(read_cache(&path, &identity).is_err());
+        assert_eq!(read_cache(&path, &changed).unwrap().len(), 1);
+
+        let mut changed_contents = changed.clone();
+        changed_contents.sha256 = "b".repeat(64);
+        assert_ne!(
+            cache_file_path(&changed),
+            cache_file_path(&changed_contents)
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
