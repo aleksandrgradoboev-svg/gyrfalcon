@@ -51,6 +51,7 @@ impl Profile {
         // `all`. Роль, чьё дело — читать, стирать индексы не должна.
         const ANALYSIS: &[&str] = &[
             "list_projects",
+            "kb_1c",
             "find",
             "object",
             "assist_bsl",
@@ -73,6 +74,7 @@ impl Profile {
         // общее стоп-условие «нет индекса — нет работы» он попадает сам.
         const SCOUT: &[&str] = &[
             "list_projects",
+            "kb_1c",
             "find",
             "object",
             "assist_bsl",
@@ -111,6 +113,7 @@ pub const TOOLS: &[Tool] = &[
         description: "Удалить ИНДЕКС конфигурации: закрыть его, снять слежение              за исходниками, убрать файл. Исходники 1С не трогает. Нужен потому,              что удалить файл снаружи при работающем сервере нельзя — он его              держит. Отвечает исходом словом: deleted / not_found / delete_failed.",
         schema: schema_delete_project,
     },
+    Tool { name: "kb_1c", description: "Найти пользовательскую встроенную справку Ext/Help в индексе выбранного проекта. Требует одно явное имя project из list_projects; справка другого проекта не смешивается. Источник обновляется при сборке индекса. Это не API платформы и не проектные правила.", schema: schema_kb_1c },
     Tool {
         name: "find",
         description: "Найти объект метаданных, модуль или метод. Три способа поиска за один \
@@ -234,6 +237,10 @@ fn обяз(prop: Value, required: &[&str]) -> Value {
 /// перечисляющий проекты, сам требовал бы указать проект.
 fn schema_projects() -> Value {
     json!({"type": "object", "properties": {}})
+}
+
+fn schema_kb_1c() -> Value {
+    json!({"type":"object","properties":{"project":{"type":"string","description":"Ровно один проект из list_projects; обязателен и для сервера с одним индексом"},"query":{"type":"string","description":"Вопрос пользователя о работе в конфигурации этого проекта"},"source_id":{"type":"string","description":"Ограничить поиск одним подключённым источником справки"},"config_version":{"type":"string","description":"Точная версия справки конфигурации"},"limit":{"type":"integer","default":8},"full":{"type":"boolean","default":false,"description":"Вернуть текст найденных страниц до 8000 символов"}},"required":["project","query"]})
 }
 
 /// У `delete_project` проект ОБЯЗАТЕЛЕН и ровно один.
@@ -400,6 +407,7 @@ pub fn call(
         ));
     }
     match name {
+        "kb_1c" => crate::kb_1c::search(conn, args),
         "find" => find(conn, args),
         "object" => object(conn, args),
         "assist_bsl" => crate::assist_bsl::assist_bsl(conn, args),

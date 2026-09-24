@@ -49,6 +49,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("kb") => {
+            if let Err(e) = cmd_kb(&args[1..]) {
+                eprintln!("ошибка: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("update") => {
             if let Err(e) = cmd_update(&args[1..]) {
                 eprintln!("ошибка: {e}");
@@ -86,6 +92,10 @@ fn print_help() {
                       разложить скилл (правило, когда звать инструменты)
   status              состояние переноса схемы индекса
   build <путь> --out <файл> [--dict <словарь.db>]  собрать индекс: код, метаданные, семантика
+  kb sync --db <индекс> --source-id <id> --src <путь>  обновить дополнительный Ext/Help источник проекта
+  kb refresh --db <индекс>  дополнить существующий индекс справкой из его source_path
+  kb remove --db <индекс> --source-id <id>  отключить только этот источник
+  kb audit --src <путь> [--out <новый.db>]  проверить извлечение; --out создаёт QA-снимок
   scan <путь> [опции] замерить разбор модулей BSL в каталоге выгрузки
       --serial          дополнительно прогнать в один поток и показать ускорение
       --runs <N>        повторить замер N раз (по умолчанию 1)
@@ -517,6 +527,101 @@ fn cmd_update(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_kb(args: &[String]) -> Result<(), String> {
+    use gyrfalcon_index::help;
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("нужны kb sync, kb refresh, kb remove или kb audit")?;
+    if action != "sync" && action != "refresh" && action != "remove" && action != "audit" {
+        return Err(format!("неизвестная операция kb: {action}"));
+    }
+    let mut db: Option<PathBuf> = None;
+    let mut source_id: Option<String> = None;
+    let mut src: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--db" => {
+                i += 1;
+                db = Some(PathBuf::from(args.get(i).ok_or("--db без значения")?));
+            }
+            "--out" if action == "audit" => {
+                i += 1;
+                db = Some(PathBuf::from(args.get(i).ok_or("--out без значения")?));
+            }
+            "--source-id" => {
+                i += 1;
+                source_id = Some(args.get(i).ok_or("--source-id без значения")?.clone());
+            }
+            "--src" => {
+                i += 1;
+                src = Some(PathBuf::from(args.get(i).ok_or("--src без значения")?));
+            }
+            other => return Err(format!("неизвестный параметр kb: {other}")),
+        }
+        i += 1;
+    }
+    if action == "audit" {
+        if source_id.is_some() {
+            return Err("kb audit не принимает --source-id".into());
+        }
+        let src = src.ok_or("для kb audit нужен --src")?;
+        let mut conn = if let Some(out) = db {
+            if out.exists() {
+                return Err(format!("QA-снимок уже существует: {}", out.display()));
+            }
+            rusqlite::Connection::open(out).map_err(|e| e.to_string())?
+        } else {
+            rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?
+        };
+        let r = help::sync(&mut conn, "audit", &src)?;
+        println!("HTML {}, сырого HTML байт {}, добавлено {}, коротких {}, заголовочных {}, одинаковых текстов {}, текстовых байт {}",
+            r.html_files, r.raw_html_bytes, r.added, r.skipped_short, r.title_only, r.duplicate_texts, r.text_bytes);
+        return Ok(());
+    }
+    let db = db.ok_or("нужен --db с индексом конкретного проекта")?;
+    if !db.is_file() {
+        return Err(format!("индекс проекта не найден: {}", db.display()));
+    }
+    if action == "refresh" {
+        if src.is_some() || source_id.is_some() {
+            return Err("kb refresh принимает только --db; источник берётся из индекса".into());
+        }
+        let info = gyrfalcon_index::build::info(&db).map_err(|e| e.to_string())?;
+        let mut conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+        let r = help::sync(&mut conn, "primary", &PathBuf::from(info.source_path))?;
+        println!("primary: HTML {}, хэшировано {}, разобрано {}, добавлено {}, обновлено {}, без изменений {}, удалено {}, текстовых байт {}",
+            r.html_files, r.hashed, r.parsed, r.added, r.updated, r.unchanged, r.removed, r.text_bytes);
+        return Ok(());
+    }
+    let source_id = source_id.ok_or("нужен --source-id")?;
+    if source_id == "primary" {
+        return Err(
+            "источник primary управляется командами build/refresh; используйте другой source-id"
+                .into(),
+        );
+    }
+    let mut conn = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
+    match action {
+        "sync" => {
+            let src = src.ok_or("для kb sync нужен --src")?;
+            let r = help::sync(&mut conn, &source_id, &src)?;
+            println!("{source_id}: HTML {}, сырого HTML байт {}, хэшировано {}, разобрано {}, добавлено {}, обновлено {}, без изменений {}, удалено {}, коротких {}, заголовочных {}, одинаковых текстов {}, текстовых байт {}",
+                r.html_files, r.raw_html_bytes, r.hashed, r.parsed, r.added, r.updated, r.unchanged, r.removed, r.skipped_short, r.title_only, r.duplicate_texts, r.text_bytes);
+        }
+        "remove" => {
+            if src.is_some() {
+                return Err("для kb remove --src не используется".into());
+            }
+            let n = help::remove(&mut conn, &source_id)?;
+            println!("источник {source_id} отключён: удалено {n} страниц");
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 /// Файлы .bsl, изменившиеся после сборки индекса.
 fn собрать_изменившиеся(src: &std::path::Path, built_at: u64) -> Vec<PathBuf> {
     walkdir::WalkDir::new(src)
@@ -577,6 +682,12 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
 
     println!("Модулей   {}", r.modules);
     println!("Методов   {}", r.methods);
+    println!("Справка Ext/Help: HTML {}, сырого HTML байт {}, хэшировано {}, разобрано {}, добавлено {}, пропущено коротких {}, не прочитано {}, заголовочных {}, повторов текста {}, байт текста {}",
+        r.help.html_files, r.help.raw_html_bytes, r.help.hashed, r.help.parsed, r.help.added, r.help.skipped_short, r.help.unreadable,
+        r.help.title_only, r.help.duplicate_texts, r.help.text_bytes);
+    if let Some(error) = &r.help_error {
+        eprintln!("Предупреждение: справка Ext/Help не синхронизирована: {error}");
+    }
     println!("Областей  {}", r.regions);
     println!("Рёбер     {}", r.calls);
     println!();

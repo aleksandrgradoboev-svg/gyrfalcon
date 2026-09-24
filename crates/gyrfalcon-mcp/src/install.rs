@@ -79,6 +79,7 @@ pub const SKILL: &str = concat!(
     "| Не знаю имени, знаю смысл | `find(query=\"как считается себестоимость\", semantic=true)` |\n",
     "| Какие реквизиты, типы, табличные части? | `object(name)` |\n",
     "| **Нужно написать код по задаче** | `assist_bsl(task, module, source)` — методы, объекты, официальный синтаксис и дополнения |\n",
+    "| **Как работать в типовой конфигурации** | `kb_1c(project, query)` — пользовательская встроенная справка только выбранного проекта; её версию и адрес называйте в выводе |\n",
     "| По каким регистрам двигает документ? | `object(name, parts=[\"movements\"])` или `movements(document)` |\n",
     "| Кто пишет в этот регистр? | `movements(register)` |\n",
     "| Кто вызывает процедуру? | `callers(method, direction=\"in\")` |\n",
@@ -242,7 +243,7 @@ pub const SKILL: &str = concat!(
     "|---|---|\n",
     "| `all` | все инструменты, включая `sql` |\n",
     "| `analysis` | без `sql` |\n",
-    "| `scout` | `list_projects`, `find`, `object`, `assist_bsl`, `read`, `schema`, `coverage`, `grep`, `check_bsl` |\n",
+    "| `scout` | `list_projects`, `kb_1c`, `find`, `object`, `assist_bsl`, `read`, `schema`, `coverage`, `grep`, `check_bsl` |\n",
     "\n",
     "Если инструмента нет в `tools/list` — он не выдан этой роли, и обходить это\n",
     "через `sql` не нужно: его в таком профиле тоже нет.\n",
@@ -393,6 +394,7 @@ impl Tier {
         match self {
             Tier::Scout => &[
                 "list_projects",
+                "kb_1c",
                 "find",
                 "object",
                 "assist_bsl",
@@ -404,6 +406,7 @@ impl Tier {
             ],
             Tier::Verify => &[
                 "list_projects",
+                "kb_1c",
                 "find",
                 "object",
                 "assist_bsl",
@@ -420,6 +423,7 @@ impl Tier {
             Tier::Auditor => &[
                 "list_projects",
                 "delete_project",
+                "kb_1c",
                 "find",
                 "object",
                 "assist_bsl",
