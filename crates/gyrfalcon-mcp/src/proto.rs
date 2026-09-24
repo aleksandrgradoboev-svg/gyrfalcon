@@ -170,9 +170,10 @@ mod tests {
 
     #[test]
     fn согласованная_версия_попадает_в_ответ() {
-        let r = initialize_result("gyrfalcon", "0.1.6", "2025-06-18");
+        let r = initialize_result("gyrfalcon", env!("CARGO_PKG_VERSION"), "2025-06-18");
         assert_eq!(r["protocolVersion"], "2025-06-18");
         assert_eq!(r["serverInfo"]["name"], "gyrfalcon");
+        assert_eq!(r["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
