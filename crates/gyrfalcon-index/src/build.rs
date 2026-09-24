@@ -23,6 +23,7 @@ use crate::classify::{self, ModuleInfo};
 use crate::ddl;
 use crate::extensions;
 use crate::forms;
+use crate::help;
 use crate::integration;
 use crate::meta;
 use crate::meta2;
@@ -39,6 +40,10 @@ use std::time::Instant;
 /// Отчёт о сборке. Числа нужны для главного критерия — скорости индексации.
 #[derive(Debug, Clone, Default)]
 pub struct BuildReport {
+    /// Встроенная пользовательская справка проекта из Ext/Help.
+    pub help: help::HelpReport,
+    /// Ошибка справки не останавливает построение навигации по коду.
+    pub help_error: Option<String>,
     pub modules: u64,
     pub methods: u64,
     pub regions: u64,
@@ -116,6 +121,17 @@ pub(crate) struct ModuleData {
 pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport> {
     let started = Instant::now();
     let mut report = BuildReport::default();
+    let old_help = help::snapshot(out).map_err(IndexError::Unsupported)?;
+    if let Some(previous) = old_help.primary_root() {
+        let canonical = src.canonicalize()?;
+        if Path::new(previous) != canonical {
+            return Err(IndexError::Unsupported(format!(
+                "индекс Help принадлежит другому проекту: {previous}; новый источник {}",
+                canonical.display()
+            )));
+        }
+    }
+    let extra_help_sources = old_help.extra_sources();
 
     // --- обход ---
     let t = Instant::now();
@@ -145,6 +161,7 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     let mut conn = Connection::open(out)?;
     conn.execute_batch(ddl::BUILD_PRAGMAS)?;
     conn.execute_batch(ddl::SCHEMA)?;
+    help::restore(&mut conn, old_help).map_err(IndexError::Unsupported)?;
 
     let tables = write_modules(&mut conn, &parsed, &mut report)?;
 
@@ -191,6 +208,45 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
         tracing::info!("словарь: {n} векторов из {}", d.display());
     }
     write_semantic(&mut conn, &mut report)?;
+
+    // Справка живёт в этом же проектном индексе: соседний проект физически
+    // не может попасть в ответ. Полная пересборка перечитывает его источник.
+    match help::sync(&mut conn, "primary", src) {
+        Ok(help_report) => report.help = help_report,
+        Err(error) => report.help_error = Some(error),
+    }
+    for (id, root) in extra_help_sources {
+        if !root.is_dir() {
+            match help::remove(&mut conn, &id) {
+                Ok(removed) => report.help.removed += removed,
+                Err(error) => report.help_error = Some(format!("{id}: {error}")),
+            }
+            continue;
+        }
+        let extra = match help::sync(&mut conn, &id, &root) {
+            Ok(report) => report,
+            Err(error) => {
+                report.help_error = Some(match report.help_error {
+                    Some(previous) => format!("{previous}; {id}: {error}"),
+                    None => format!("{id}: {error}"),
+                });
+                continue;
+            }
+        };
+        report.help.html_files += extra.html_files;
+        report.help.raw_html_bytes += extra.raw_html_bytes;
+        report.help.hashed += extra.hashed;
+        report.help.parsed += extra.parsed;
+        report.help.added += extra.added;
+        report.help.updated += extra.updated;
+        report.help.unchanged += extra.unchanged;
+        report.help.removed += extra.removed;
+        report.help.skipped_short += extra.skipped_short;
+        report.help.unreadable += extra.unreadable;
+        report.help.title_only += extra.title_only;
+        report.help.duplicate_texts += extra.duplicate_texts;
+        report.help.text_bytes += extra.text_bytes;
+    }
 
     // --- лексический поиск: вторая половина раздельной выдачи (Р-016) ---
     //
@@ -1850,6 +1906,60 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let e = build(&dir, &dir.join("i.db"), None);
         assert!(matches!(e, Err(IndexError::NoModules(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn повторная_сборка_справки_инкрементальна_и_не_блокирует_код() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gyrfalcon-build-help-incremental-{}-{nonce}",
+            std::process::id()
+        ));
+        корпус(&dir);
+        let help_dir = dir.join("Catalogs/Товар/Ext/Help");
+        std::fs::create_dir_all(&help_dir).unwrap();
+        let first = help_dir.join("ru.html");
+        let second = help_dir.join("en.html");
+        std::fs::write(
+            &first,
+            "<h1>Товар</h1><p>Исходная инструкция по заполнению карточки товара.</p>",
+        )
+        .unwrap();
+        let db = dir.join("index.db");
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!((r.help.added, r.help.parsed), (1, 1));
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!((r.help.unchanged, r.help.parsed, r.help.added), (1, 0, 0));
+        std::fs::write(
+            &first,
+            "<h1>Товар</h1><p>Изменённая инструкция по заполнению карточки товара.</p>",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "<h1>Product</h1><p>Additional instructions for filling in a product card.</p>",
+        )
+        .unwrap();
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!((r.help.parsed, r.help.updated, r.help.added), (2, 1, 1));
+        std::fs::remove_file(&second).unwrap();
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!((r.help.parsed, r.help.removed, r.help.unchanged), (0, 1, 1));
+        // Ошибка необязательной справки не делает индекс кода непригодным.
+        std::fs::write(&first, [0xff, 0xfe, 0xfd]).unwrap();
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!(r.modules, 2);
+        assert!(r.help_error.is_some());
+        let conn = Connection::open(&db).unwrap();
+        let modules: i64 = conn
+            .query_row("SELECT count(*) FROM modules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(modules, 2);
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -14,6 +14,7 @@ pub mod grep;
 pub mod hooks;
 pub mod http;
 pub mod install;
+pub mod kb_1c;
 pub mod mcp_http;
 pub mod platform_help;
 pub mod proto;

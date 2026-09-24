@@ -20,3 +20,5 @@ crossbeam-channel.workspace = true
 rayon.workspace = true
 walkdir.workspace = true
 quick-xml.workspace = true
+regex.workspace = true
+sha2.workspace = true

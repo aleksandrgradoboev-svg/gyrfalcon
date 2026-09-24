@@ -44,6 +44,7 @@ pub mod extensions;
 pub mod forms;
 pub mod freshness;
 pub mod git;
+pub mod help;
 pub mod incremental;
 pub mod integration;
 pub mod meta;
