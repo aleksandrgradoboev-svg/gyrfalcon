@@ -6,7 +6,7 @@
 //! девятью инструментами и профилями под роль (Р-101, Р-104). Плюс прежние
 //! команды сборки и замера.
 
-use gyrfalcon_mcp::{hooks, http, install, mcp_http, registry, server, tools};
+use gyrfalcon_mcp::{hooks, http, install, mcp_http, project_practices, registry, server, tools};
 
 use gyrfalcon_index::schema;
 use gyrfalcon_parser::scan;
@@ -55,6 +55,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("practices") => {
+            if let Err(e) = cmd_practices(&args[1..]) {
+                eprintln!("ошибка: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("update") => {
             if let Err(e) = cmd_update(&args[1..]) {
                 eprintln!("ошибка: {e}");
@@ -96,6 +102,20 @@ fn print_help() {
   kb refresh --db <индекс>  дополнить существующий индекс справкой из его source_path
   kb remove --db <индекс> --source-id <id>  отключить только этот источник
   kb audit --src <путь> [--out <новый.db>]  проверить извлечение; --out создаёт QA-снимок
+  practices import --src <путь> --project <имя> --commit <sha> --document <.md>
+                      загрузить заголовки документации как кандидаты практик
+  practices add --src <путь> --project <имя> --commit <sha> --rule <rule.json>
+                      вручную добавить правило из JSON; MCP выдаст его только после проверки
+  practices discover --db <индекс> --project <имя> [--depth quick|full]
+                      явно дополнить существующий профиль кандидатами из BSL-модулей
+  practices preview --db <индекс> --project <имя> [--depth quick|full] [--out <report.json>]
+                      проверить полный корпус и кандидатов без изменения профиля
+  practices accept --db <индекс> --project <имя> --id <id> --sample <N> --matches <N>
+                   --module <путь.bsl> --method <имя>
+                      принять кандидата только после проверки адреса и метрик
+  practices approve --db <индекс> --project <имя> --id <id> --authority customer|project
+                    --reviewer <кто> --reason <основание>
+                      принять нормативное правило по явному решению и источнику
   scan <путь> [опции] замерить разбор модулей BSL в каталоге выгрузки
       --serial          дополнительно прогнать в один поток и показать ускорение
       --runs <N>        повторить замер N раз (по умолчанию 1)
@@ -107,6 +127,191 @@ fn print_help() {
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_REPOSITORY")
     );
+}
+
+fn cmd_practices(args: &[String]) -> Result<(), String> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("нужна команда practices import|add|discover|accept|approve")?;
+    let mut src = None;
+    let mut project = None;
+    let mut commit = None;
+    let mut document = None;
+    let mut rule = None;
+    let mut db = None;
+    let mut id = None;
+    let mut sample = None;
+    let mut matches = None;
+    let mut module = None;
+    let mut method = None;
+    let mut authority = None;
+    let mut out = None;
+    let mut depth = None;
+    let mut reviewer = None;
+    let mut reason = None;
+    let mut i = 1;
+    while i < args.len() {
+        let flag = &args[i];
+        i += 1;
+        let value = args
+            .get(i)
+            .ok_or_else(|| format!("{flag} без значения"))?
+            .clone();
+        i += 1;
+        match flag.as_str() {
+            "--src" => src = Some(value),
+            "--project" => project = Some(value),
+            "--commit" => commit = Some(value),
+            "--document" => document = Some(value),
+            "--rule" => rule = Some(value),
+            "--db" => db = Some(value),
+            "--id" => id = Some(value),
+            "--sample" => sample = Some(value),
+            "--matches" => matches = Some(value),
+            "--module" => module = Some(value),
+            "--method" => method = Some(value),
+            "--authority" => authority = Some(value),
+            "--out" => out = Some(value),
+            "--depth" => depth = Some(value),
+            "--reviewer" => reviewer = Some(value),
+            "--reason" => reason = Some(value),
+            _ => return Err(format!("неизвестная опция practices: {flag}")),
+        }
+    }
+    let mining_depth = match depth.as_deref() {
+        None | Some("quick") => gyrfalcon_mcp::practice_mining::MiningDepth::Quick,
+        Some("full") => gyrfalcon_mcp::practice_mining::MiningDepth::Full,
+        Some(_) => return Err("--depth: допустимо quick или full".into()),
+    };
+    match action {
+        "import" => {
+            let src = src.ok_or("нужен --src")?;
+            let project = project.ok_or("нужен --project")?;
+            let commit = commit.ok_or("нужен --commit")?;
+            let document = document.ok_or("practices import требует --document")?;
+            let added = project_practices::import_document(&src, &project, &commit, &document)?;
+            println!("документация импортирована; добавлено кандидатов: {added}");
+        }
+        "add" => {
+            let src = src.ok_or("нужен --src")?;
+            let project = project.ok_or("нужен --project")?;
+            let commit = commit.ok_or("нужен --commit")?;
+            let file = rule.ok_or("practices add требует --rule <rule.json>")?;
+            let value = serde_json::from_str(
+                &std::fs::read_to_string(&file)
+                    .map_err(|e| format!("не прочитан rule JSON: {e}"))?,
+            )
+            .map_err(|e| format!("некорректный rule JSON: {e}"))?;
+            project_practices::add_manual(&src, &project, &commit, value)?;
+            println!("ручной кандидат добавлен; до приёмки project_practices его не выдаст");
+        }
+        "discover" => {
+            let project = project.ok_or("practices discover требует --project")?;
+            let db = db.ok_or("practices discover требует --db")?;
+            if std::path::Path::new(&db)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                != Some(project.as_str())
+            {
+                return Err("--project не совпадает с именем файла индекса --db".into());
+            }
+            let conn = rusqlite::Connection::open_with_flags(
+                db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| format!("не открыт индекс: {e}"))?;
+            let added = project_practices::discover_with_depth(&conn, &project, mining_depth)?;
+            println!("добавлено кандидатов из модулей: {added}; существующие правила сохранены");
+        }
+        "preview" => {
+            let project = project.ok_or("practices preview требует --project")?;
+            let db = db.ok_or("practices preview требует --db")?;
+            if std::path::Path::new(&db)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                != Some(project.as_str())
+            {
+                return Err("--project не совпадает с именем файла индекса --db".into());
+            }
+            let conn = rusqlite::Connection::open_with_flags(
+                db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| format!("не открыт индекс: {e}"))?;
+            let source: String = conn
+                .query_row(
+                    "SELECT value FROM index_meta WHERE key='source_path'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("не прочитан source_path: {e}"))?;
+            let mined = gyrfalcon_mcp::practice_mining::mine(&conn, &source, mining_depth)?;
+            let report = serde_json::json!({"project":project,"source_path":source,
+                "coverage":mined.coverage,"candidates":mined.candidates});
+            if let Some(path) = out {
+                let encoded = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+                std::fs::write(&path, encoded)
+                    .map_err(|e| format!("не записан отчёт {path}: {e}"))?;
+                println!("отчёт: {path}");
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "project":project,"coverage":report["coverage"],
+                    "candidate_count":report["candidates"].as_array().map_or(0, Vec::len)
+                }))
+                .map_err(|e| e.to_string())?
+            );
+        }
+        "accept" => {
+            let project = project.ok_or("practices accept требует --project")?;
+            let db = db.ok_or("practices accept требует --db")?;
+            let sample: i64 = sample
+                .ok_or("нужен --sample")?
+                .parse()
+                .map_err(|_| "--sample: не число")?;
+            let matches: i64 = matches
+                .ok_or("нужен --matches")?
+                .parse()
+                .map_err(|_| "--matches: не число")?;
+            let conn = rusqlite::Connection::open_with_flags(
+                db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| format!("не открыт индекс: {e}"))?;
+            project_practices::accept(
+                &conn,
+                &project,
+                &id.ok_or("нужен --id")?,
+                sample,
+                matches,
+                &module.ok_or("нужен --module")?,
+                &method.ok_or("нужен --method")?,
+            )?;
+            println!("кандидат принят; теперь его отдаст project_practices");
+        }
+        "approve" => {
+            let project = project.ok_or("practices approve требует --project")?;
+            let db = db.ok_or("practices approve требует --db")?;
+            let conn = rusqlite::Connection::open_with_flags(
+                db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| format!("не открыт индекс: {e}"))?;
+            project_practices::approve(
+                &conn,
+                &project,
+                &id.ok_or("нужен --id")?,
+                &authority.ok_or("нужен --authority")?,
+                &reviewer.ok_or("нужен --reviewer")?,
+                &reason.ok_or("нужен --reason")?,
+            )?;
+            println!("нормативное правило принято; источник и решение записаны в профиль");
+        }
+        _ => return Err("practices: import, add, discover, accept или approve".into()),
+    }
+    Ok(())
 }
 
 fn print_status() {

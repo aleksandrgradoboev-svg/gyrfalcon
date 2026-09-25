@@ -52,6 +52,8 @@ impl Profile {
         const ANALYSIS: &[&str] = &[
             "list_projects",
             "kb_1c",
+            "project_practices",
+            "standards_1c",
             "find",
             "object",
             "assist_bsl",
@@ -76,6 +78,8 @@ impl Profile {
         const SCOUT: &[&str] = &[
             "list_projects",
             "kb_1c",
+            "project_practices",
+            "standards_1c",
             "find",
             "object",
             "assist_bsl",
@@ -115,6 +119,8 @@ pub const TOOLS: &[Tool] = &[
         schema: schema_delete_project,
     },
     Tool { name: "kb_1c", description: "Найти пользовательскую встроенную справку Ext/Help в индексе выбранного проекта. Требует одно явное имя project из list_projects; справка другого проекта не смешивается. Источник обновляется при сборке индекса. Это не API платформы и не проектные правила.", schema: schema_kb_1c },
+    Tool { name: "project_practices", description: "Единый базовый слой стандартов 1С плюс принятые практики одного проекта. Пустой профиль автоматически получает быстрый проход по индексу BSL-модулей: пары областей учитываются как свидетельства к общему стандарту, а проверяемые API-сценарии попадают в кандидаты с выборкой тел методов; непустой профиль не перезаполняется. Полный поиск AST и вызовов пока исследовательский. view=candidates показывает локальные кандидаты и конфликты с базисом.", schema: schema_project_practices },
+    Tool { name: "standards_1c", description: "Единый локальный корпус официальных стандартов 1С: view=search ищет пункты, catalog перечисляет статьи, article и clause читают источник, practices отдаёт принятые общие правила с поиском и пагинацией. Корпус общий для всех проектов; принятые исключения показываются отдельно.", schema: schema_standards_1c },
     Tool {
         name: "find",
         description: "Найти объект метаданных, модуль или метод. Три способа поиска за один \
@@ -247,6 +253,24 @@ fn schema_projects() -> Value {
 
 fn schema_kb_1c() -> Value {
     json!({"type":"object","properties":{"project":{"type":"string","description":"Ровно один проект из list_projects; обязателен и для сервера с одним индексом"},"query":{"type":"string","description":"Вопрос пользователя о работе в конфигурации этого проекта"},"source_id":{"type":"string","description":"Ограничить поиск одним подключённым источником справки"},"config_version":{"type":"string","description":"Точная версия справки конфигурации"},"limit":{"type":"integer","default":8},"full":{"type":"boolean","default":false,"description":"Вернуть текст найденных страниц до 8000 символов"}},"required":["project","query"]})
+}
+
+fn schema_project_practices() -> Value {
+    json!({"type":"object","properties":{"project":{"type":"string","description":"Ровно один проект из list_projects; практики разных конфигураций не смешиваются"},"view":{"type":"string","enum":["verified","candidates"],"default":"verified","description":"candidates добавляет не принятые практики для просмотра"}},"required":["project"]})
+}
+
+fn schema_standards_1c() -> Value {
+    json!({"type":"object","properties":{
+        "project":{"type":"string","description":"Ровно один проект из list_projects; корпус стандартов общий"},
+        "view":{"type":"string","enum":["search","catalog","article","clause","practices"],"default":"search"},
+        "query":{"type":"string","description":"Тема для view=search или фильтр принятых практик"},
+        "rule_id":{"type":"string","description":"Точный ID общего правила для view=practices"},
+        "article_id":{"type":"string","description":"ID статьи для view=article"},
+        "clause_id":{"type":"string","description":"Адрес пункта для view=clause"},
+        "offset":{"type":"integer","default":0,"minimum":0,"description":"Смещение каталога или текста пункта"},
+        "max_chars":{"type":"integer","default":4000,"minimum":1,"maximum":8000,"description":"Длина фрагмента для view=clause"},
+        "limit":{"type":"integer","default":8,"minimum":1,"maximum":50}},
+        "required":["project"]})
 }
 
 /// У `delete_project` проект ОБЯЗАТЕЛЕН и ровно один.
@@ -427,6 +451,8 @@ pub fn call(
     }
     match name {
         "kb_1c" => crate::kb_1c::search(conn, args),
+        "project_practices" => crate::project_practices::profile(conn, args),
+        "standards_1c" => crate::standards_1c::search(conn, args),
         "find" => find(conn, args),
         "object" => object(conn, args),
         "assist_bsl" => crate::assist_bsl::assist_bsl(conn, args),
