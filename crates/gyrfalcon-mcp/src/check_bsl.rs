@@ -60,6 +60,7 @@ pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .map(|n| (n as usize).clamp(1, MAX_LIMIT))
         .unwrap_or(DEFAULT_LIMIT);
+    let deep = args.get("deep").and_then(Value::as_bool).unwrap_or(false);
 
     let mut issues = Vec::new();
 
@@ -123,7 +124,63 @@ pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
          «не найдено» про них было бы ложью. Текст ЗАПРОСА здесь не проверяется — это \
          query_check канала данных."
     ));
+    if deep {
+        out["complexity"] = json!(метрики_сложности(source));
+    }
     Ok(out)
+}
+
+/// Недорогая метрика для выбора очередности ручной проверки. Это не заменяет
+/// статический анализатор: она намеренно прозрачна и считается по тем же
+/// словам, которые разработчик видит в BSL. Глубину считаем по парным блокам,
+/// а не по отступам — отступ в выгрузках не является синтаксисом.
+fn метрики_сложности(source: &str) -> Value {
+    let mut decisions = 0u64;
+    let mut nesting = 0u64;
+    let mut max_nesting = 0u64;
+    let mut procedures = 0u64;
+    let mut executable = 0u64;
+    for raw in source.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        executable += 1;
+        let upper = line.to_uppercase();
+        if upper.starts_with("ПРОЦЕДУРА ") || upper.starts_with("ФУНКЦИЯ ") {
+            procedures += 1;
+        }
+        if upper.starts_with("ЕСЛИ ")
+            || upper.starts_with("ИНАЧЕЕСЛИ ")
+            || upper.starts_with("ПОКА ")
+            || upper.starts_with("ДЛЯ ")
+            || upper.starts_with("ПОПЫТКА")
+        {
+            decisions += 1;
+        }
+        if upper.starts_with("ЕСЛИ ")
+            || upper.starts_with("ДЛЯ ")
+            || upper.starts_with("ПОКА ")
+            || upper.starts_with("ПОПЫТКА")
+        {
+            nesting += 1;
+            max_nesting = max_nesting.max(nesting);
+        }
+        if upper.starts_with("КОНЕЦЕСЛИ")
+            || upper.starts_with("КОНЕЦЦИКЛА")
+            || upper.starts_with("КОНЕЦПОПЫТКИ")
+        {
+            nesting = nesting.saturating_sub(1);
+        }
+    }
+    json!({
+        "cyclomatic": decisions + 1,
+        "decisions": decisions,
+        "max_nesting": max_nesting,
+        "procedures": procedures,
+        "executable_lines": executable,
+        "note": "Приближённая прозрачная метрика BSL: решения = Если/ИначеЕсли/Для/Пока/Попытка. Для углублённого аудита применяйте профильный анализатор."
+    })
 }
 
 /// Слой имён. Возвращает (проверено, пропущено).
@@ -402,6 +459,11 @@ pub fn schema() -> Value {
                 "type": "integer",
                 "default": DEFAULT_LIMIT,
                 "description": "Сколько замечаний показать; остальные посчитаны в truncated"
+            },
+            "deep": {
+                "type": "boolean",
+                "default": false,
+                "description": "Добавить прозрачные метрики сложности: ветвления, максимальная вложенность и объём"
             }
         },
         "required": ["source"]
@@ -450,6 +512,13 @@ mod tests {
         );
         assert_eq!(v["ok"], json!(true), "ложная тревога на верном коде: {v}");
         assert_eq!(v["total"], json!(0));
+    }
+
+    #[test]
+    fn глубокий_режим_выдаёт_метрики_сложности() {
+        let v = check_bsl(&индекс(), &json!({"source": "Процедура Т()\nЕсли Истина Тогда\nДля Н = 1 По 2 Цикл\nКонецЦикла;\nКонецЕсли;\nКонецПроцедуры", "deep": true})).unwrap();
+        assert_eq!(v["complexity"]["cyclomatic"], json!(3));
+        assert_eq!(v["complexity"]["max_nesting"], json!(2));
     }
 
     #[test]

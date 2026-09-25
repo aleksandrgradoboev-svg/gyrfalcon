@@ -60,6 +60,7 @@ impl Profile {
             "overrides",
             "movements",
             "detect_changes",
+            "impact",
             "schema",
             "coverage",
             "grep",
@@ -168,6 +169,11 @@ pub const TOOLS: &[Tool] = &[
              закоммиченное против базы, и рабочее дерево, и новые файлы. Отвечает на вопрос \
              ревьюера одним вызовом вместо обхода вызывающих руками.",
         schema: schema_detect_changes,
+    },
+    Tool {
+        name: "impact",
+        description: "Оценить последствия планируемой правки до появления diff: кто вызывает метод, какие подписки и задания его запускают, а для объекта — формы, права и метаданные, которые на него ссылаются. Каждая строка содержит вид связи и адрес из индекса.",
+        schema: schema_impact,
     },
     Tool {
         name: "schema",
@@ -280,10 +286,23 @@ fn schema_object() -> Value {
             "category": {"type": "string", "description":
                 "Категория (Catalogs/Documents/…), если имя неоднозначно"},
             "parts": {"type": "array", "items": {"type": "string"}, "description":
-                "Что включить: attributes, synonyms, predefined, enum_values, movements, forms. \
+                "Что включить: attributes, synonyms, predefined, enum_values, movements, forms, rights, options, subscriptions, scheduled_jobs. \
                  По умолчанию — всё, кроме forms (их бывает много)"}
         }),
         &["name"],
+    )
+}
+
+fn schema_impact() -> Value {
+    обяз(
+        json!({
+            "symbol": {"type": "string", "description": "Метод или объект, который планируется изменить"},
+            "kind": {"type": "string", "enum": ["auto", "method", "object"], "default": "auto",
+                "description": "auto сначала ищет метод, затем объект"},
+            "depth": {"type": "integer", "default": 2, "description": "Глубина входящего графа вызовов, 1-5"},
+            "limit": {"type": "integer", "default": 100}
+        }),
+        &["symbol"],
     )
 }
 
@@ -412,6 +431,7 @@ pub fn call(
         "object" => object(conn, args),
         "assist_bsl" => crate::assist_bsl::assist_bsl(conn, args),
         "callers" => callers(conn, args),
+        "impact" => impact(conn, args),
         "read" => read(conn, args),
         "overrides" => overrides(conn, args),
         "movements" => movements(conn, args),
@@ -874,6 +894,10 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                 "predefined",
                 "enum_values",
                 "movements",
+                "rights",
+                "options",
+                "subscriptions",
+                "scheduled_jobs",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -953,6 +977,44 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&name],
         )?;
     }
+    if есть("rights") {
+        out["rights"] = выборка(
+            conn,
+            "SELECT role_name, right_name, file FROM role_rights
+             WHERE object_name = ?1 COLLATE NOCASE
+             ORDER BY role_name, right_name",
+            &[&name],
+        )?;
+    }
+    if есть("options") {
+        out["options"] = выборка(
+            conn,
+            "SELECT name, synonym, location, file FROM functional_options
+             WHERE content LIKE '%' || ?1 || '%' COLLATE NOCASE
+             ORDER BY name",
+            &[&name],
+        )?;
+    }
+    if есть("subscriptions") {
+        out["subscriptions"] = выборка(
+            conn,
+            "SELECT name, event, handler_module, handler_procedure, source_types, file
+             FROM event_subscriptions
+             WHERE source_types LIKE '%' || ?1 || '%' COLLATE NOCASE
+             ORDER BY name",
+            &[&name],
+        )?;
+    }
+    if есть("scheduled_jobs") {
+        out["scheduled_jobs"] = выборка(
+            conn,
+            "SELECT name, method_name, handler_module, handler_procedure, use, file
+             FROM scheduled_jobs
+             WHERE handler_module LIKE '%' || ?1 || '%' COLLATE NOCASE
+             ORDER BY name",
+            &[&name],
+        )?;
+    }
     Ok(out)
 }
 
@@ -986,6 +1048,11 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&method, &depth, &(limit as i64)],
         )?;
         out["callers"] = v;
+        // Вызовы в модульном коде — не единственная точка входа. Подписки и
+        // регламентные задания запускаются платформой, поэтому в таблице calls
+        // их принципиально нет; без этого раздела «никто не вызывает» было бы
+        // ложным отрицанием.
+        out["platform_entrypoints"] = platform_entrypoints(conn, &method)?;
     }
     if dir == "out" || dir == "both" {
         let v = выборка(
@@ -998,6 +1065,77 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["callees"] = v;
     }
     Ok(out)
+}
+
+fn platform_entrypoints(conn: &Connection, method: &str) -> Result<Value, String> {
+    выборка(
+        conn,
+        "SELECT 'event_subscription' AS kind, name, event AS trigger,
+                handler_module, handler_procedure, file
+         FROM event_subscriptions
+         WHERE handler_procedure = ?1 COLLATE NOCASE
+         UNION ALL
+         SELECT 'scheduled_job' AS kind, name, method_name AS trigger,
+                handler_module, handler_procedure, file
+         FROM scheduled_jobs
+         WHERE handler_procedure = ?1 COLLATE NOCASE
+            OR method_name = ?1 COLLATE NOCASE
+         ORDER BY kind, name",
+        &[&method],
+    )
+}
+
+fn impact(conn: &Connection, args: &Value) -> Result<Value, String> {
+    let symbol = строка(args, "symbol").ok_or("нужен параметр symbol")?;
+    let kind = строка(args, "kind").unwrap_or_else(|| "auto".into());
+    let depth = число(args, "depth").unwrap_or(2).clamp(1, 5);
+    let limit = число(args, "limit").unwrap_or(100).clamp(1, 2000);
+    let method_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM methods WHERE name = ?1 COLLATE NOCASE",
+            rusqlite::params![&symbol],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let use_method = kind == "method" || (kind == "auto" && method_exists > 0);
+    if kind != "auto" && kind != "method" && kind != "object" {
+        return Err("kind должен быть auto, method или object".into());
+    }
+
+    if use_method {
+        if method_exists == 0 {
+            return Err(format!("метод '{symbol}' не найден в индексе"));
+        }
+        let graph = callers(
+            conn,
+            &json!({"method": symbol, "direction": "in", "depth": depth, "limit": limit}),
+        )?;
+        let direct = graph["callers"]["count"].as_u64().unwrap_or(0);
+        let entry = graph["platform_entrypoints"]["count"].as_u64().unwrap_or(0);
+        return Ok(json!({
+            "symbol": symbol, "kind": "method", "depth": depth,
+            "callers": graph["callers"], "platform_entrypoints": graph["platform_entrypoints"],
+            "risk": if entry + direct > 10 { "high" } else if entry + direct > 0 { "medium" } else { "unknown" },
+            "note": "unknown означает, что индекс не нашёл входов; перед выводом об отсутствии проверьте coverage()."
+        }));
+    }
+
+    let card = object(
+        conn,
+        &json!({"name": symbol, "parts": ["forms", "rights", "options", "subscriptions", "scheduled_jobs"]}),
+    )?;
+    let dependents = выборка(
+        conn,
+        "SELECT source_object, source_category, ref_kind, used_in, path, line
+         FROM metadata_references WHERE ref_object LIKE '%' || ?1 || '%' COLLATE NOCASE
+         ORDER BY source_category, source_object LIMIT ?2",
+        &[&symbol, &limit],
+    )?;
+    Ok(json!({
+        "symbol": symbol, "kind": "object", "card": card,
+        "metadata_dependents": dependents,
+        "note": "Для оценки конкретной процедуры вызовите impact(kind='method'); для объекта показаны адресные метаданные и платформенные связи."
+    }))
 }
 
 fn read(conn: &Connection, args: &Value) -> Result<Value, String> {
@@ -1280,6 +1418,60 @@ mod tests {
         assert!(!Profile::Scout.allows("callers"));
         assert!(Profile::Scout.allows("find"));
         assert!(Profile::Scout.allows("coverage"), "разведке нужна полнота");
+    }
+
+    #[test]
+    fn карточка_и_impact_видят_метаданные_и_платформенные_входы() {
+        // Фикстура создаётся тем же DDL, что и рабочий индекс: иначе тест
+        // проверял бы выдуманную схему и не поймал бы несовпадение колонок.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META2).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_REFS).unwrap();
+        c.execute_batch(
+            "INSERT INTO modules(id, rel_path, object_name, is_form) VALUES
+               (1, 'Documents/Заказ/ObjectModule.bsl', 'Заказ', 0),
+               (2, 'Documents/Заказ/Form.xml', 'Заказ', 1);
+             INSERT INTO methods(id, module_id, name, type, line) VALUES
+               (1, 1, 'Провести', 'Procedure', 10),
+               (2, 1, 'Запустить', 'Procedure', 20);
+             INSERT INTO calls(id, caller_id, callee_name, line, resolution, confidence) VALUES
+               (1, 2, 'Провести', 21, 'exact', 1.0);
+             INSERT INTO role_rights(role_name, object_name, right_name, file) VALUES
+               ('Менеджер', 'Заказ', 'Read', 'Roles/Менеджер.xml');
+             INSERT INTO functional_options(name, content, file) VALUES
+               ('ИспользоватьЗаказы', 'Document.Заказ', 'FunctionalOptions/Заказы.xml');
+             INSERT INTO event_subscriptions(name, event, handler_module, handler_procedure, source_types, file) VALUES
+               ('ПередПроведениемЗаказа', 'BeforeWrite', 'Заказ', 'Провести', '[\"Document.Заказ\"]', 'EventSubscriptions/Заказ.xml');
+             INSERT INTO scheduled_jobs(name, method_name, handler_module, handler_procedure, file) VALUES
+               ('НочнойЗаказ', 'Провести', 'Заказ', 'Провести', 'ScheduledJobs/Заказ.xml');
+             INSERT INTO metadata_references(source_object, source_category, ref_object, ref_kind, used_in, path) VALUES
+               ('Продажа', 'Documents', 'Заказ', 'attribute_type', 'Document.Продажа.Заказ', 'Documents/Продажа.xml');",
+        ).unwrap();
+
+        let card = object(&c, &json!({"name": "Заказ", "parts": ["forms", "rights", "options", "subscriptions", "scheduled_jobs"]})).unwrap();
+        assert_eq!(card["forms"]["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(card["rights"]["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(card["subscriptions"]["rows"].as_array().unwrap().len(), 1);
+
+        let method = impact(&c, &json!({"symbol": "Провести", "kind": "method"})).unwrap();
+        assert_eq!(
+            method["platform_entrypoints"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(method["risk"], json!("medium"));
+        let object = impact(&c, &json!({"symbol": "Заказ", "kind": "object"})).unwrap();
+        assert_eq!(
+            object["metadata_dependents"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

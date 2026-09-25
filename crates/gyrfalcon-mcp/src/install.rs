@@ -89,6 +89,7 @@ pub const SKILL: &str = concat!(
     "| **Какие конфигурации знает сервер? Что писать в `project`?** | `list_projects()` |
 ",
     "| Влияние правки (транзитивно) | `callers(method, direction=\"in\", depth=3)` |\n",
+    "| **Что затронет планируемая правка до diff?** | `impact(symbol, kind)` — граф вызовов, подписки, задания и адресные метаданные |\n",
     "| **Что сломает этот MR / мои правки?** | `detect_changes()` — diff → задетые методы → риск |
 ",
     "| Влияние правки против ветки | `detect_changes(base_branch=\"main\", depth=3)` |\n",
@@ -415,6 +416,7 @@ impl Tier {
                 "overrides",
                 "movements",
                 "detect_changes",
+                "impact",
                 "schema",
                 "coverage",
                 "grep",
@@ -432,6 +434,7 @@ impl Tier {
                 "overrides",
                 "movements",
                 "detect_changes",
+                "impact",
                 "schema",
                 "coverage",
                 "sql",
