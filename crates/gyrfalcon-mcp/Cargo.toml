@@ -30,3 +30,4 @@ notify.workspace = true
 walkdir.workspace = true
 zip.workspace = true
 sha2.workspace = true
+tree-sitter = "0.25"

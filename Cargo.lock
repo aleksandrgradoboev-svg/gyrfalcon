@@ -262,6 +262,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tracing",
+ "tree-sitter",
  "walkdir",
  "zip",
 ]
