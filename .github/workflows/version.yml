@@ -1,0 +1,57 @@
+name: Версия
+
+# PR, меняющий код, обязан поднять версию в [workspace.package] корневого
+# Cargo.toml. Иначе релиз забывается молча: правка влита, а версия, тег и
+# выпуск остались прежними (случай 01.10.2026 — версию подняли отдельным PR
+# после напоминания). Проверяет машина, а не память того, кто правит.
+#
+# Код не менялся (документация, CI) — проверка не срабатывает. Код менялся,
+# а выпуск не нужен — ярлык `no-version-bump` на PR.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  bump:
+    name: версия поднята
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Сверить версию с main
+        env:
+          BASE: ${{ github.base_ref }}
+          SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'no-version-bump') }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin "$BASE"
+          # Первая строка `version = ` корневого Cargo.toml — это [workspace.package].
+          ver() { grep -m1 -E '^version = "' | sed -E 's/^version = "([^"]+)".*/\1/'; }
+          base_ver=$(git show "origin/$BASE:Cargo.toml" | ver)
+          head_ver=$(ver < Cargo.toml)
+          echo "main: $base_ver, PR: $head_ver"
+
+          code=$(git diff --name-only "origin/$BASE...HEAD" \
+            | grep -E '^(crates/|src/|build\.rs$|Cargo\.(toml|lock)$)' || true)
+          if [ -z "$code" ]; then
+            echo "Код не менялся — версия не обязана расти."
+            exit 0
+          fi
+          if [ "$SKIP" = "true" ]; then
+            echo "::notice::Ярлык no-version-bump: проверка пропущена по решению автора PR."
+            exit 0
+          fi
+          if [ "$head_ver" = "$base_ver" ]; then
+            echo "::error file=Cargo.toml::Версия не поднята: $head_ver = main. Поднимите [workspace.package] version или поставьте ярлык no-version-bump."
+            echo "Изменён код:"; echo "$code"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$head_ver" >/dev/null; then
+            echo "::error file=Cargo.toml::Тег v$head_ver уже существует — эта версия выпущена. Нужна следующая."
+            exit 1
+          fi
+          echo "Версия поднята: $base_ver → $head_ver"

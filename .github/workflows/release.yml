@@ -1,0 +1,109 @@
+name: Выпуск
+
+# После слияния в main: если тега vX.Y.Z для версии из Cargo.toml ещё нет —
+# поставить его, собрать бинарь под Windows и завести ЧЕРНОВИК релиза с ним.
+# Публикует человек: описание выпуска авторское, а публикация в открытый
+# репозиторий необратима. Перед публикацией — скачать ассет и сверить SHA-256
+# с описанием: тег и черновик ещё не выпуск.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    name: тег
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      ver: ${{ steps.tag.outputs.ver }}
+      need_release: ${{ steps.release.outputs.need }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Тег
+        id: tag
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin
+          ver=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
+          tag="v$ver"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "Тег $tag уже есть — ставить нечего."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          echo "Поставлен тег $tag на ${GITHUB_SHA::7}"
+
+      - name: Нужен ли черновик
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Релиз $TAG уже заведён."
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  draft:
+    name: сборка и черновик
+    needs: tag
+    if: needs.tag.outputs.need_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Тулчейн
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Сборка
+        run: cargo build --release -p gyrfalcon-mcp
+
+      - name: Черновик релиза
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          VER: ${{ needs.tag.outputs.ver }}
+        run: |
+          set -euo pipefail
+          exe="gyrfalcon-$TAG-windows-x64.exe"
+          cp target/release/gyrfalcon.exe "$exe"
+          # Бинарь обязан назвать ту версию, под которой выпускается.
+          ./"$exe" --help | head -1 | grep -F "gyrfalcon $VER " \
+            || { echo "::error::Бинарь сообщает не $VER"; exit 1; }
+          sha=$(sha256sum "$exe" | cut -d' ' -f1)
+          cat > notes.md <<EOF
+          ⚠️ **Черновик, заведён автоматически.** Перед публикацией:
+
+          - [ ] заменить этот текст описанием выпуска;
+          - [ ] после публикации скачать ассет и сверить SHA-256.
+
+          \`$exe\` — SHA-256 \`$sha\` (собран в CI, windows-latest)
+          EOF
+          gh release create "$TAG" "$exe" --draft --verify-tag \
+            --title "$TAG" --notes-file notes.md
+          echo "Заведён черновик релиза $TAG"
