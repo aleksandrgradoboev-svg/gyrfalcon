@@ -285,6 +285,9 @@ impl Server {
         let путь = std::path::PathBuf::from(ключ);
         self.соединения.remove(ключ);
         let итог = досборка.догнать(&очередь);
+        // Векторы в памяти после записи в индекс — уже не правда. Отпечаток
+        // файла это тоже заметит, но разрешение mtime не повод рисковать.
+        gyrfalcon_index::semantic::cache::forget(&путь);
         if let Ok(c) = crate::sql::open_readonly(&путь) {
             self.соединения.insert(ключ.to_string(), c);
         }

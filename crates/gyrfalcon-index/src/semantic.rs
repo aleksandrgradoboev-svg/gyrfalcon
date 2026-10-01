@@ -411,18 +411,32 @@ pub struct Hit {
 /// Это осознанно (так же у первоисточника), но означает, что стоимость
 /// запроса линейна по корпусу, и на порядок больших конфигурациях
 /// понадобится либо отбор кандидатов, либо ANN.
+///
+/// # Кэш корпуса
+///
+/// Перебор полный, и до 01.10.2026 каждый вызов заново читал все векторы
+/// из SQLite: на корпусе в 580 тысяч это 1,4 из 1,8 с одного `find`.
+/// Если кэш включён ([`set_cache_limit`]) и соединение открыто на файл,
+/// корпус читается один раз и дальше берётся из памяти. Выдача от кэша
+/// не зависит — это проверяется тестом, а не обещается.
 pub fn search(
     conn: &Connection,
     query: &str,
     kind: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Hit>> {
-    let dict = Dictionary::load(conn)?;
+    if let Some(корпус) = cache::получить(conn)? {
+        return search_in(conn, &корпус, query, kind, limit);
+    }
+    search_streaming(conn, query, kind, limit)
+}
 
-    // Вектор запроса: та же токенизация и те же веса, что при сборке.
+/// Вектор запроса: та же токенизация и те же веса, что при сборке.
+/// `None` — запрос не дал ни одного ненулевого вектора.
+fn query_vector(conn: &Connection, dict: &Dictionary, query: &str) -> Result<Option<Vector>> {
     let tokens = gyrfalcon_parser::tokens::tokenize(query);
     if tokens.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let mut idf_of = HashMap::new();
     {
@@ -451,12 +465,45 @@ pub fn search(
     }
     let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm <= f32::EPSILON {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let mut q = [0i8; DIM];
     for (k, slot) in q.iter_mut().enumerate() {
         *slot = (acc[k] / norm * 127.0).round().clamp(-127.0, 127.0) as i8;
     }
+    Ok(Some(q))
+}
+
+/// Обрезать по лимиту и нормировать по выдаче. Общая часть обоих путей.
+fn finish(mut hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    hits.truncate(limit);
+    // Нормировка по выдаче — тот самый урок 10.08.2026. Она нужна не здесь
+    // (одиночный сигнал ранжируется и без неё), а на входе в общую формулу
+    // с лексикой: без приведения к общему разбросу косинус в сумме исчезает.
+    // Поэтому `raw` сохраняется рядом — иначе после нормировки «лучший из
+    // мусора» и «точное попадание» выглядят одинаково.
+    let mut scores: Vec<f32> = hits.iter().map(|h| h.raw).collect();
+    rank_normalized(&mut scores);
+    for (h, s) in hits.iter_mut().zip(scores) {
+        h.score = s;
+    }
+    hits
+}
+
+/// Прежний путь без кэша: векторы читаются из SQLite потоком.
+///
+/// Остаётся для CLI и встраивающих приложений, где кэш выключен: там
+/// разовый запрос не должен закреплять за процессом сотни мегабайт.
+fn search_streaming(
+    conn: &Connection,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    let dict = Dictionary::load(conn)?;
+    let Some(q) = query_vector(conn, &dict, query)? else {
+        return Ok(Vec::new());
+    };
 
     let sql = match kind {
         Some(_) => "SELECT kind, ref_id, name, vector FROM semantic_vectors WHERE kind = ?1",
@@ -501,17 +548,425 @@ pub fn search(
             .partial_cmp(&a.raw)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(limit);
+    Ok(finish(hits, limit))
+}
 
-    // Нормировка по выдаче — тот самый урок 10.08.2026. Она нужна не здесь
-    // (одиночный сигнал ранжируется и без неё), а на входе в общую формулу
-    // с лексикой: без приведения к общему разбросу косинус в сумме исчезает.
-    // Поэтому `raw` сохраняется рядом — иначе после нормировки «лучший из
-    // мусора» и «точное попадание» выглядят одинаково.
-    let mut scores: Vec<f32> = hits.iter().map(|h| h.raw).collect();
-    rank_normalized(&mut scores);
-    for (h, s) in hits.iter_mut().zip(scores) {
-        h.score = s;
+/// Корпус индекса в памяти: словарь и все векторы одним плоским буфером.
+///
+/// Плоский `Vec<i8>`, а не `Vec<[i8; DIM]>` с именами рядом: перебор идёт
+/// по памяти подряд, и норма каждого вектора посчитана заранее — при
+/// поиске остаётся одно скалярное произведение на строку.
+pub struct Corpus {
+    dict: Dictionary,
+    /// Различные значения `kind` (их два-три); у строки — номер в этом списке.
+    kinds: Vec<String>,
+    kind_of: Vec<u8>,
+    ref_ids: Vec<i64>,
+    names: Vec<String>,
+    vectors: Vec<i8>,
+    /// Квадрат нормы каждого вектора — целым, как его считает [`cosine`].
+    norms: Vec<i32>,
+}
+
+impl Corpus {
+    /// Прочитать корпус в том же порядке строк, что и потоковый путь.
+    pub fn load(conn: &Connection) -> Result<Self> {
+        let dict = Dictionary::load(conn)?;
+        let mut c = Corpus {
+            dict,
+            kinds: Vec::new(),
+            kind_of: Vec::new(),
+            ref_ids: Vec::new(),
+            names: Vec::new(),
+            vectors: Vec::new(),
+            norms: Vec::new(),
+        };
+        // Нет таблицы — та же ошибка prepare, что у потокового пути: кэш не
+        // должен превращать отказ в пустую выдачу.
+        let mut st = conn.prepare("SELECT kind, ref_id, name, vector FROM semantic_vectors")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let blob = r.get_ref(3)?.as_blob().map_err(rusqlite::Error::from)?;
+            if blob.len() != DIM {
+                continue; // то же правило, что у потокового пути: порча не вектор
+            }
+            let kind: String = r.get(0)?;
+            let k = match c.kinds.iter().position(|x| *x == kind) {
+                Some(i) => i,
+                None => {
+                    c.kinds.push(kind);
+                    c.kinds.len() - 1
+                }
+            };
+            c.kind_of.push(k as u8);
+            c.ref_ids.push(r.get(1)?);
+            c.names.push(r.get(2)?);
+            let начало = c.vectors.len();
+            c.vectors.extend(blob.iter().map(|b| *b as i8));
+            c.norms
+                .push(dot(&c.vectors[начало..], &c.vectors[начало..]));
+        }
+        c.vectors.shrink_to_fit();
+        Ok(c)
     }
-    Ok(hits)
+
+    /// Строк в корпусе.
+    pub fn len(&self) -> usize {
+        self.ref_ids.len()
+    }
+
+    /// Пуст ли корпус.
+    pub fn is_empty(&self) -> bool {
+        self.ref_ids.is_empty()
+    }
+
+    /// Сколько памяти держит корпус, байт (оценка снизу: без служебных
+    /// заголовков аллокатора). Ею меряется потолок кэша.
+    pub fn bytes(&self) -> usize {
+        self.vectors.len()
+            + self.norms.len() * 4
+            + self.ref_ids.len() * 8
+            + self.kind_of.len()
+            + self.names.iter().map(|n| n.len() + 24).sum::<usize>()
+            + self.dict.len() * (DIM + 48)
+    }
+}
+
+fn dot(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b).map(|(x, y)| *x as i32 * *y as i32).sum()
+}
+
+/// Поиск по корпусу в памяти. Результат совпадает с потоковым путём
+/// бит в бит: тот же косинус, тот же порядок при равных оценках.
+pub fn search_in(
+    conn: &Connection,
+    корпус: &Corpus,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    let Some(q) = query_vector(conn, &корпус.dict, query)? else {
+        return Ok(Vec::new());
+    };
+    let qn = dot(&q, &q);
+    let фильтр: Option<u8> = match kind {
+        Some(k) => match корпус.kinds.iter().position(|x| x == k) {
+            Some(i) => Some(i as u8),
+            None => return Ok(finish(Vec::new(), limit)),
+        },
+        None => None,
+    };
+
+    let mut оценки: Vec<(f32, usize)> = Vec::with_capacity(корпус.len());
+    for i in 0..корпус.len() {
+        if let Some(f) = фильтр {
+            if корпус.kind_of[i] != f {
+                continue;
+            }
+        }
+        let v = &корпус.vectors[i * DIM..(i + 1) * DIM];
+        let nb = корпус.norms[i];
+        // Ровно формула `cosine`: те же целые, те же преобразования в f32.
+        let raw = if qn == 0 || nb == 0 {
+            0.0
+        } else {
+            let c = dot(&q, v) as f32 / ((qn as f32).sqrt() * (nb as f32).sqrt());
+            ((c + 1.0) / 2.0).clamp(0.0, 1.0)
+        };
+        оценки.push((raw, i));
+    }
+
+    // Порядок потокового пути — устойчивая сортировка по убыванию, то есть
+    // при равенстве раньше идёт строка, прочитанная раньше. Номер строки
+    // в сравнении воспроизводит это без сортировки всех 580 тысяч.
+    let порядок = |a: &(f32, usize), b: &(f32, usize)| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    };
+    if limit < оценки.len() {
+        оценки.select_nth_unstable_by(limit, порядок);
+        оценки.truncate(limit);
+    }
+    оценки.sort_by(порядок);
+
+    let hits = оценки
+        .into_iter()
+        .map(|(raw, i)| Hit {
+            kind: корпус.kinds[корпус.kind_of[i] as usize].clone(),
+            ref_id: корпус.ref_ids[i],
+            name: корпус.names[i].clone(),
+            score: raw,
+            raw,
+        })
+        .collect();
+    Ok(finish(hits, limit))
+}
+
+/// Кэш корпусов на процесс: ключ — путь файла индекса.
+///
+/// # Почему на процесс, а не на соединение
+///
+/// Сервер закрывает и заново открывает соединение на время автодосборки,
+/// а встраивающие приложения держат свои соединения. Привязка к пути
+/// и отпечатку файла переживает и то и другое.
+///
+/// # Когда кэш перестаёт быть правдой
+///
+/// Отпечаток — размер и время изменения файла индекса и его `-wal`.
+/// Любая запись (досборка, полная пересборка поверх) меняет его, и корпус
+/// перечитывается при следующем вызове. Сервер вдобавок сбрасывает
+/// корпус явно после досборки ([`cache::forget`]) — не полагаясь на
+/// разрешение времени файловой системы.
+pub mod cache {
+    use super::Corpus;
+    use crate::Result;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::SystemTime;
+
+    type Отпечаток = Vec<(u64, Option<SystemTime>)>;
+
+    struct Запись {
+        корпус: Arc<Corpus>,
+        отпечаток: Отпечаток,
+        байт: usize,
+        обращение: u64,
+    }
+
+    #[derive(Default)]
+    struct Кэш {
+        потолок: usize,
+        записи: HashMap<PathBuf, Запись>,
+        счётчик: u64,
+    }
+
+    fn кэш() -> &'static Mutex<Кэш> {
+        static К: OnceLock<Mutex<Кэш>> = OnceLock::new();
+        К.get_or_init(|| Mutex::new(Кэш::default()))
+    }
+
+    /// Задать потолок памяти под корпуса, байт. 0 — кэш выключен
+    /// (умолчание: включает тот, кто знает, что процесс живёт долго).
+    pub fn set_limit(байт: usize) {
+        let mut к = кэш().lock().unwrap();
+        к.потолок = байт;
+        вытеснить(&mut к, 0);
+    }
+
+    /// Сбросить корпус индекса — после записи в него.
+    pub fn forget(db: &Path) {
+        let mut к = кэш().lock().unwrap();
+        к.записи.remove(db);
+    }
+
+    /// Что сейчас в кэше: путь, строк, байт — для отчёта сервера.
+    pub fn stats() -> Vec<(PathBuf, usize, usize)> {
+        let к = кэш().lock().unwrap();
+        к.записи
+            .iter()
+            .map(|(p, з)| (p.clone(), з.корпус.len(), з.байт))
+            .collect()
+    }
+
+    fn отпечаток(db: &Path) -> Отпечаток {
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        [db.to_path_buf(), wal]
+            .iter()
+            .map(|p| match std::fs::metadata(p) {
+                Ok(m) => (m.len(), m.modified().ok()),
+                Err(_) => (0, None),
+            })
+            .collect()
+    }
+
+    fn вытеснить(к: &mut Кэш, нужно: usize) {
+        loop {
+            let занято: usize = к.записи.values().map(|з| з.байт).sum();
+            if занято + нужно <= к.потолок || к.записи.is_empty() {
+                return;
+            }
+            let старейший = к
+                .записи
+                .iter()
+                .min_by_key(|(_, з)| з.обращение)
+                .map(|(p, _)| p.clone())
+                .expect("непусто");
+            к.записи.remove(&старейший);
+        }
+    }
+
+    /// Корпус для соединения или `None`, если кэш выключен, база не в файле
+    /// (`:memory:`) или корпус больше потолка целиком.
+    pub(super) fn получить(conn: &Connection) -> Result<Option<Arc<Corpus>>> {
+        let Some(путь) = conn.path().filter(|p| !p.is_empty()).map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let отп = отпечаток(&путь);
+        {
+            let mut к = кэш().lock().unwrap();
+            if к.потолок == 0 {
+                return Ok(None);
+            }
+            к.счётчик += 1;
+            let n = к.счётчик;
+            if let Some(з) = к.записи.get_mut(&путь) {
+                if з.отпечаток == отп {
+                    з.обращение = n;
+                    return Ok(Some(з.корпус.clone()));
+                }
+            }
+            к.записи.remove(&путь);
+        }
+        // Читаем без замка: чтение корпуса — секунды, и держать замок
+        // ради него значит остановить поиск по другим индексам.
+        let корпус = Arc::new(Corpus::load(conn)?);
+        let байт = корпус.bytes();
+        let mut к = кэш().lock().unwrap();
+        if байт > к.потолок {
+            // Не помещается даже один — отвечаем по нему, но не держим.
+            return Ok(Some(корпус));
+        }
+        вытеснить(&mut к, байт);
+        к.счётчик += 1;
+        let обращение = к.счётчик;
+        к.записи.insert(
+            путь,
+            Запись {
+                корпус: корпус.clone(),
+                отпечаток: отп,
+                байт,
+                обращение,
+            },
+        );
+        Ok(Some(корпус))
+    }
+}
+
+/// Задать потолок кэша корпусов, мегабайт. 0 — выключить. См. [`cache`].
+pub fn set_cache_limit(мб: usize) {
+    cache::set_limit(мб * 1024 * 1024);
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Индекс-файл с векторами: часть строк — точные дубли (равные оценки),
+    /// два вида, одна строка с испорченным блобом.
+    fn база(имя: &str) -> (std::path::PathBuf, Connection) {
+        let p = std::env::temp_dir().join(format!("gf-semcache-{имя}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch(
+            "CREATE TABLE semantic_tokens(token TEXT PRIMARY KEY, idf REAL);
+             CREATE TABLE semantic_vectors(id INTEGER PRIMARY KEY, kind TEXT, ref_id INTEGER,
+                                           name TEXT, vector BLOB);",
+        )
+        .unwrap();
+        let слова = [
+            "заказ",
+            "клиента",
+            "проведение",
+            "себестоимость",
+            "номенклатура",
+        ];
+        let mut n = 0i64;
+        for повтор in 0..3 {
+            for (i, слово) in слова.iter().enumerate() {
+                let v = random_indexing(слово);
+                let blob: Vec<u8> = v.iter().map(|x| *x as u8).collect();
+                let вид = if i % 2 == 0 { "method" } else { "object" };
+                n += 1;
+                c.execute(
+                    "INSERT INTO semantic_vectors(kind, ref_id, name, vector) VALUES (?1,?2,?3,?4)",
+                    rusqlite::params![вид, n, format!("{слово}{повтор}"), blob],
+                )
+                .unwrap();
+            }
+        }
+        c.execute(
+            "INSERT INTO semantic_vectors(kind, ref_id, name, vector) VALUES ('method', 999, 'порча', x'0102')",
+            [],
+        )
+        .unwrap();
+        c.execute("INSERT INTO semantic_tokens VALUES ('заказ', 2.5)", [])
+            .unwrap();
+        (p, c)
+    }
+
+    fn одинаковы(ждали: &[Hit], вышло: &[Hit]) {
+        assert_eq!(ждали.len(), вышло.len());
+        for (x, y) in ждали.iter().zip(вышло) {
+            assert_eq!((&x.kind, x.ref_id, &x.name), (&y.kind, y.ref_id, &y.name));
+            assert_eq!(x.raw.to_bits(), y.raw.to_bits(), "raw у {}", x.name);
+            assert_eq!(x.score.to_bits(), y.score.to_bits(), "score у {}", x.name);
+        }
+    }
+
+    #[test]
+    fn корпус_в_памяти_даёт_ту_же_выдачу_бит_в_бит() {
+        let (p, c) = база("равенство");
+        let корпус = Corpus::load(&c).unwrap();
+        assert_eq!(корпус.len(), 15, "испорченный блоб в корпус не входит");
+        for запрос in [
+            "заказ",
+            "заказ клиента",
+            "себестоимость номенклатуры",
+            "ъъъ",
+        ] {
+            for вид in [None, Some("method"), Some("object"), Some("нет-такого")] {
+                for лимит in [1, 3, 7, 100] {
+                    let ждали = search_streaming(&c, запрос, вид, лимит).unwrap();
+                    let вышло = search_in(&c, &корпус, запрос, вид, лимит).unwrap();
+                    одинаковы(&ждали, &вышло);
+                }
+            }
+        }
+        drop(c);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn кэш_сбрасывается_при_записи_в_индекс() {
+        let (p, c) = база("сброс");
+        cache::set_limit(64 * 1024 * 1024);
+        let первый = cache::получить(&c).unwrap().expect("кэш включён");
+        let второй = cache::получить(&c).unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&первый, &второй),
+            "повторный вызов берёт из памяти"
+        );
+
+        let v: Vec<u8> = random_indexing("новое").iter().map(|x| *x as u8).collect();
+        c.execute(
+            "INSERT INTO semantic_vectors(kind, ref_id, name, vector) VALUES ('method', 1000, 'новое', ?1)",
+            [v],
+        )
+        .unwrap();
+        let после = cache::получить(&c).unwrap().unwrap();
+        assert_eq!(
+            после.len(),
+            первый.len() + 1,
+            "запись в файл видна без перезапуска"
+        );
+
+        cache::forget(&p);
+        let после_сброса = cache::получить(&c).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&после, &после_сброса));
+
+        cache::forget(&p);
+        drop(c);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn база_в_памяти_не_кэшируется() {
+        let c = Connection::open_in_memory().unwrap();
+        cache::set_limit(64 * 1024 * 1024);
+        assert!(cache::получить(&c).unwrap().is_none());
+    }
 }
