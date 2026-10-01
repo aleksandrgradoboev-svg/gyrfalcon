@@ -89,6 +89,9 @@ fn print_help() {
 Команды:
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
                       [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
+                      [--semantic-cache-mb 1536]
+                                       держать векторы смыслового поиска в памяти
+                                       (потолок на все индексы; 0 — читать с диска каждый раз)
                       [--http [--port 8788] [--bind 127.0.0.1]]
                                        транспорт Streamable HTTP вместо stdio
                       MCP-сервер (по умолчанию stdio — для клиента вроде Claude Code)
@@ -588,6 +591,10 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let mut http = false;
     let mut port: Option<u16> = None;
     let mut bind: Option<String> = None;
+    // Векторы смыслового поиска в памяти. Включено для сервера и только для
+    // него: он живёт долго, и перечитывать 580 тысяч векторов на каждый
+    // `find` (1,4 из 1,8 с, замер 01.10.2026) дороже, чем держать их.
+    let mut semantic_cache_mb: usize = 1536;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -622,6 +629,14 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                 i += 1;
                 bind = Some(args.get(i).ok_or("--bind без значения")?.clone());
             }
+            "--semantic-cache-mb" => {
+                i += 1;
+                semantic_cache_mb = args
+                    .get(i)
+                    .ok_or("--semantic-cache-mb без значения")?
+                    .parse()
+                    .map_err(|_| "--semantic-cache-mb: не число")?;
+            }
             other => return Err(format!("неизвестный параметр: {other}")),
         }
         i += 1;
@@ -641,6 +656,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         );
     }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
+    gyrfalcon_index::semantic::set_cache_limit(semantic_cache_mb);
     let mut сервер =
         server::Server::new(источник, profile).с_автодосборкой(auto_update);
     if http {
