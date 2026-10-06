@@ -722,9 +722,9 @@ pub mod cache {
     use super::Corpus;
     use crate::Result;
     use rusqlite::Connection;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
     use std::time::SystemTime;
 
     type Отпечаток = Vec<(u64, Option<SystemTime>)>;
@@ -741,11 +741,37 @@ pub mod cache {
         потолок: usize,
         записи: HashMap<PathBuf, Запись>,
         счётчик: u64,
+        /// Корпуса, которые сейчас читает какой-то поток.
+        ///
+        /// Без этого два потока, впервые спросившие один индекс, прочли бы
+        /// его оба — вдвое дольше по диску и вдвое по памяти, ради корпуса,
+        /// который второму достался бы от первого.
+        грузятся: HashSet<PathBuf>,
     }
 
     fn кэш() -> &'static Mutex<Кэш> {
         static К: OnceLock<Mutex<Кэш>> = OnceLock::new();
         К.get_or_init(|| Mutex::new(Кэш::default()))
+    }
+
+    /// Сигнал «чтение корпуса закончилось» — для потоков, ждущих его.
+    fn загружен() -> &'static Condvar {
+        static С: OnceLock<Condvar> = OnceLock::new();
+        С.get_or_init(Condvar::new)
+    }
+
+    /// Снимает отметку «грузится» при любом исходе чтения, ошибка и паника
+    /// включительно: иначе ждущие потоки ждали бы вечно.
+    struct Снять(PathBuf);
+
+    impl Drop for Снять {
+        fn drop(&mut self) {
+            let mut к = кэш()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            к.грузятся.remove(&self.0);
+            загружен().notify_all();
+        }
     }
 
     /// Задать потолок памяти под корпуса, байт. 0 — кэш выключен
@@ -807,19 +833,29 @@ pub mod cache {
         let отп = отпечаток(&путь);
         {
             let mut к = кэш().lock().unwrap();
-            if к.потолок == 0 {
-                return Ok(None);
-            }
-            к.счётчик += 1;
-            let n = к.счётчик;
-            if let Some(з) = к.записи.get_mut(&путь) {
-                if з.отпечаток == отп {
-                    з.обращение = n;
-                    return Ok(Some(з.корпус.clone()));
+            loop {
+                if к.потолок == 0 {
+                    return Ok(None);
                 }
+                к.счётчик += 1;
+                let n = к.счётчик;
+                if let Some(з) = к.записи.get_mut(&путь) {
+                    if з.отпечаток == отп {
+                        з.обращение = n;
+                        return Ok(Some(з.корпус.clone()));
+                    }
+                }
+                if !к.грузятся.contains(&путь) {
+                    break;
+                }
+                // Этот корпус уже читает другой поток — дождаться его и
+                // взять готовое, а не читать второй раз.
+                к = загружен().wait(к).unwrap();
             }
             к.записи.remove(&путь);
+            к.грузятся.insert(путь.clone());
         }
+        let _снять = Снять(путь.clone());
         // Читаем без замка: чтение корпуса — секунды, и держать замок
         // ради него значит остановить поиск по другим индексам.
         let корпус = Arc::new(Corpus::load(conn)?);
@@ -927,6 +963,41 @@ mod cache_tests {
             }
         }
         drop(c);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn одновременные_потоки_читают_корпус_один_раз() {
+        // Многопоточный HTTP-сервер (0.1.14): потоки, впервые спросившие один
+        // индекс, обязаны получить ОДИН корпус. Прочитай каждый свой — вышли
+        // бы разные `Arc`, а по памяти и диску цена умножилась бы на число
+        // потоков (корпус живого индекса — около 0,7 ГБ).
+        let (p, c) = база("разом");
+        drop(c);
+        cache::set_limit(64 * 1024 * 1024);
+        cache::forget(&p);
+        let потоков = 8;
+        let старт = Arc::new(std::sync::Barrier::new(потоков));
+        let корпуса: Vec<Arc<Corpus>> = (0..потоков)
+            .map(|_| {
+                let (p, старт) = (p.clone(), Arc::clone(&старт));
+                std::thread::spawn(move || {
+                    let c = Connection::open(&p).unwrap();
+                    старт.wait();
+                    cache::получить(&c).unwrap().expect("кэш включён")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        for к in &корпуса[1..] {
+            assert!(
+                Arc::ptr_eq(&корпуса[0], к),
+                "каждый поток прочёл свой корпус вместо общего"
+            );
+        }
+        cache::forget(&p);
         let _ = std::fs::remove_file(p);
     }
 

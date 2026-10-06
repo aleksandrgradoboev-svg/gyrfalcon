@@ -47,9 +47,17 @@ impl std::fmt::Display for SqlError {
 ///
 /// Главный рубеж защиты: даже если разбор текста что-то пропустит, запись
 /// невозможна на уровне соединения.
+///
+/// С ожиданием занятости: индекс может писать `gyrfalcon update`, запущенный
+/// рядом отдельным процессом, — замок проекта внутри сервера его не видит.
+/// Без ожидания чтение на его коммите отказало бы `database is locked`
+/// сразу, хотя запись длится доли секунды.
 pub fn open_readonly(db: &Path) -> Result<Connection, SqlError> {
-    Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| SqlError::Sqlite(e.to_string()))
+    let c = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    c.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    Ok(c)
 }
 
 /// Ключевые слова, которых не должно быть в read-only запросе.
