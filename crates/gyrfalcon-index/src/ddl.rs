@@ -30,12 +30,17 @@
 /// | 1 | веха 2: шесть таблиц кода, граф вызовов с классом резолвинга |
 /// | 2 | веха 3: ядро метаданных; в `object_attributes` добавлены квалификаторы |
 /// | 3 | веха 7: `index_meta.git_commit`, индекс `idx_calls_caller` |
+/// | 4 | Р-022: расширения целиком — `extensions`, `extension_objects`; строки расширений во всех таблицах с адресом `../ext/<Имя>/…` |
 ///
 /// Версия 3 совместима со 2 по чтению: столбцов не убавилось, а новый
 /// индекс лишь ускоряет. Поэтому `MIN_READABLE_SCHEMA` не поднят —
 /// прежние индексы продолжают работать, просто медленнее на исходящих
 /// рёбрах и без сверки коммита.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Версия 4 совместима с 3 по чтению: таблицы только добавлены. Индекс
+/// версии 3 читается, но кода расширений в нём нет — это видно по
+/// `schema_version`, и пересборка его возвращает.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Минимальная версия схемы, которую умеет читать этот код.
 ///
@@ -528,6 +533,28 @@ CREATE TABLE IF NOT EXISTS extension_overrides (
     ext_module_path TEXT NOT NULL,
     ext_line INTEGER
 );
+
+-- Реестр расширений: все найденные, с перехватами или без (Р-022).
+-- rel_root — адрес корня от source_path: `../ext/<Имя>`. Им же начинаются
+-- адреса всех строк расширения в остальных таблицах.
+CREATE TABLE IF NOT EXISTS extensions (
+    name TEXT NOT NULL,
+    purpose TEXT,
+    name_prefix TEXT,
+    rel_root TEXT NOT NULL
+);
+
+-- Состав расширений: объект и его принадлежность.
+-- belonging: `own` — объект расширения; `adopted` — заимствован из основной
+-- конфигурации, его собственные свойства берутся оттуда, а здесь записано
+-- лишь то, что расширение добавило.
+CREATE TABLE IF NOT EXISTS extension_objects (
+    extension_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    object_name TEXT NOT NULL,
+    belonging TEXT NOT NULL,
+    source_file TEXT NOT NULL
+);
 "#;
 
 /// Индексы перехватов: спрашивают их «кто перехватил этот метод»
@@ -537,6 +564,8 @@ CREATE INDEX IF NOT EXISTS idx_eo_object ON extension_overrides(object_name COLL
 CREATE INDEX IF NOT EXISTS idx_eo_target ON extension_overrides(target_method COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_eo_ext ON extension_overrides(extension_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_eo_annot ON extension_overrides(annotation);
+CREATE INDEX IF NOT EXISTS idx_extobj_obj ON extension_objects(object_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_extobj_ext ON extension_objects(extension_name COLLATE NOCASE);
 "#;
 
 /// Семантический слой (веха 4).

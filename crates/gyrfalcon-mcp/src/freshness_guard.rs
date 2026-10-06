@@ -395,11 +395,7 @@ fn поставить_подписку(
             состояние.изменено_событиями.fetch_add(1, Ordering::AcqRel);
             let mut примеры = состояние.примеры.lock().unwrap();
             if примеры.len() < ПРИМЕРОВ {
-                let отн = p
-                    .strip_prefix(&корень_для_путей)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let отн = gyrfalcon_index::extensions::rel_from(&корень_для_путей, &p);
                 if !примеры.contains(&отн) {
                     примеры.push(отн);
                 }
@@ -409,6 +405,13 @@ fn поставить_подписку(
 
     let mut w = notify::recommended_watcher(обработчик).ok()?;
     w.watch(корень, RecursiveMode::Recursive).ok()?;
+    // Каталоги расширений лежат соседями `src` (Р-022) и в индексе наравне
+    // с основной конфигурацией. Подписка на контейнер, а не на каждое
+    // расширение: новое расширение, положенное туда, тоже должно быть видно.
+    // Неудача здесь не роняет основную подписку — деградация, а не молчание.
+    for d in gyrfalcon_index::extensions::extension_dirs(корень) {
+        let _ = w.watch(&d, RecursiveMode::Recursive);
+    }
     Some(Box::new(w))
 }
 

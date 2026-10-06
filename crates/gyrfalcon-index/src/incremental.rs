@@ -135,11 +135,8 @@ pub fn update(db: &Path, src: &Path, files: &[std::path::PathBuf]) -> Result<Inc
     let mut разобранные = Vec::new();
     let mut удаляемые = Vec::new();
     for path in files {
-        let rel = path
-            .strip_prefix(src)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // Тот же адрес, что пишет полная сборка: файл расширения — `../ext/…`.
+        let rel = crate::extensions::rel_from(src, path);
         if !path.is_file() {
             удаляемые.push(rel);
             continue;
@@ -431,18 +428,32 @@ fn собрать_таблицы(conn: &Connection) -> Result<ResolveTables> {
         );
     }
 
-    for (rel, методы) in по_модулю {
-        let info = crate::classify::classify(&rel);
+    // Порядок как в полной сборке: сначала основная конфигурация, потом
+    // расширения, и модуль расширения занимает имя, только если оно свободно
+    // (Р-022). Обход `HashMap` в произвольном порядке отдал бы имя заимствованного
+    // общего модуля то основной конфигурации, то расширению — от запуска к запуску.
+    let mut модули: Vec<(String, HashMap<String, MethodRef>)> = по_модулю.into_iter().collect();
+    модули.sort_by_key(|(rel, _)| crate::extensions::расширение_пути(rel).is_some());
+    for (rel, методы) in модули {
+        let из_расширения = crate::extensions::расширение_пути(&rel).is_some();
+        let info = crate::classify::classify(crate::extensions::путь_внутри(&rel));
+        let занять = |карта: &mut HashMap<String, (String, HashMap<String, MethodRef>)>,
+                      имя: &str| {
+            let запись = (rel.clone(), методы.clone());
+            if из_расширения {
+                карта.entry(имя.to_lowercase()).or_insert(запись);
+            } else {
+                карта.insert(имя.to_lowercase(), запись);
+            }
+        };
         if crate::classify::is_common_module(&info) {
             if let Some(имя) = &info.object_name {
-                t.common_modules
-                    .insert(имя.to_lowercase(), (rel.clone(), методы.clone()));
+                занять(&mut t.common_modules, имя);
             }
         }
         if crate::classify::is_manager_module(&info) {
             if let Some(имя) = &info.object_name {
-                t.managers
-                    .insert(имя.to_lowercase(), (rel.clone(), методы.clone()));
+                занять(&mut t.managers, имя);
             }
         }
         t.by_module.insert(rel, методы);

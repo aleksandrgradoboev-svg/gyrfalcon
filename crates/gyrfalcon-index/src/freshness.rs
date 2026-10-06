@@ -223,8 +223,12 @@ fn изменённые(root: &Path, built_at: u64) -> (usize, Vec<String>) {
     // сразу после успешной пересборки — и правило «отставание значит
     // отставание» умерло бы на первом же ложном срабатывании.
     let порог = built_at + 1;
-    for e in WalkDir::new(root)
-        .into_iter()
+    // Расширения — часть индекса (Р-022), значит и часть его свежести:
+    // правка модуля расширения так же делает ответы устаревшими.
+    let корни = crate::extensions::корни(root);
+    for e in корни
+        .iter()
+        .flat_map(|к| WalkDir::new(&к.dir).into_iter())
         .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
     {
@@ -244,13 +248,7 @@ fn изменённые(root: &Path, built_at: u64) -> (usize, Vec<String>) {
         if d.as_secs() > порог {
             n += 1;
             if примеры.len() < ПРИМЕРОВ {
-                let rel = e
-                    .path()
-                    .strip_prefix(root)
-                    .unwrap_or(e.path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                примеры.push(rel);
+                примеры.push(crate::extensions::rel_from(root, e.path()));
             }
         }
     }

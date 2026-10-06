@@ -126,6 +126,98 @@ pub fn collect_extensions(dir: &Path) -> Vec<Extension> {
     out
 }
 
+/// Корень разбора: основная конфигурация или одно расширение.
+///
+/// # Почему расширение — такой же корень, а не таблица перехватов
+///
+/// До 06.10.2026 из расширений бралось только `extension_overrides`: модуль
+/// без перехвата отбрасывался целиком, метаданные не читались вовсе. На ДО
+/// это значило, что новые общие модули, регистры, обработки и роли девяти
+/// расширений в индексе отсутствовали, а два расширения без перехватов не
+/// существовали для индекса совсем. Ответ «такого нет» на живой код —
+/// худший вид отказа. Решение владельца 06.10.2026: расширение индексируется
+/// полностью, тем же разбором, что и основная конфигурация (Р-022).
+#[derive(Debug, Clone)]
+pub struct Корень {
+    pub dir: PathBuf,
+    /// `None` — основная конфигурация.
+    pub extension: Option<Extension>,
+}
+
+/// Все корни проекта: сначала основная конфигурация, потом расширения по имени.
+///
+/// Порядок не косметический: при совпадении имён (заимствованный общий модуль
+/// лежит в расширении под тем же именем, что в основной) адресатом вызова
+/// остаётся объект основной конфигурации, а он должен быть записан первым.
+pub fn корни(src: &Path) -> Vec<Корень> {
+    let mut out = vec![Корень {
+        dir: src.to_path_buf(),
+        extension: None,
+    }];
+    for d in extension_dirs(src) {
+        for ext in collect_extensions(&d) {
+            out.push(Корень {
+                dir: ext.root.clone(),
+                extension: Some(ext),
+            });
+        }
+    }
+    out
+}
+
+/// Путь файла относительно `src`, разделителем `/`.
+///
+/// Файл расширения лежит соседом `src`, поэтому его адрес начинается с `../`:
+/// `../ext/Доработка/CommonModules/X/Ext/Module.bsl`. Это рабочий путь —
+/// `src.join(rel)` открывает файл, — и та же форма, что отдаёт прежний
+/// инструмент, так что агенту не нужно переучиваться. Признак «это расширение»
+/// читается по префиксу, отдельного столбца в каждой таблице не требуется.
+pub fn rel_from(src: &Path, path: &Path) -> String {
+    if let Ok(r) = path.strip_prefix(src) {
+        return r.to_string_lossy().replace('\\', "/");
+    }
+    if let Some(parent) = src.parent() {
+        if let Ok(r) = path.strip_prefix(parent) {
+            return format!("../{}", r.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Корень, внутри которого лежит файл: `src` либо `<родитель>/ext|cfe/<Имя>`.
+///
+/// Нужен там, где файл приходит по одному (инкремент, сторож свежести):
+/// классификация модуля идёт по пути ВНУТРИ его выгрузки, а не от `src`.
+pub fn корень_файла(src: &Path, path: &Path) -> Option<PathBuf> {
+    if path.starts_with(src) {
+        return Some(src.to_path_buf());
+    }
+    for d in extension_dirs(src) {
+        if let Ok(r) = path.strip_prefix(&d) {
+            let имя = r.components().next()?;
+            return Some(d.join(имя.as_os_str()));
+        }
+    }
+    None
+}
+
+/// Имя расширения по адресу файла: `../ext/<Имя>/…` → `<Имя>`.
+pub fn расширение_пути(rel: &str) -> Option<&str> {
+    let хвост = rel.strip_prefix("../")?;
+    let mut it = хвост.splitn(3, '/');
+    let _контейнер = it.next()?;
+    it.next()
+}
+
+/// Путь внутри выгрузки, которой принадлежит файл: `../ext/<Имя>/X/Y` → `X/Y`.
+/// Путь основной конфигурации возвращается как есть.
+pub fn путь_внутри(rel: &str) -> &str {
+    match rel.strip_prefix("../") {
+        Some(хвост) => хвост.splitn(3, '/').nth(2).unwrap_or(rel),
+        None => rel,
+    }
+}
+
 /// Назначение и префикс из манифеста расширения.
 fn parse_manifest(path: &Path) -> (Option<String>, Option<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -189,4 +281,27 @@ pub fn object_of_path(rel: &str) -> String {
         .nth(1)
         .unwrap_or_default()
         .to_string()
+}
+
+#[cfg(test)]
+mod тесты_адреса {
+    use super::*;
+
+    #[test]
+    fn адрес_расширения_от_src() {
+        let src = Path::new("C:/p/src");
+        assert_eq!(
+            rel_from(src, Path::new("C:/p/src/CommonModules/А/Ext/Module.bsl")),
+            "CommonModules/А/Ext/Module.bsl"
+        );
+        let r = rel_from(
+            src,
+            Path::new("C:/p/ext/Доработка/CommonModules/Б/Ext/Module.bsl"),
+        );
+        assert_eq!(r, "../ext/Доработка/CommonModules/Б/Ext/Module.bsl");
+        assert_eq!(расширение_пути(&r), Some("Доработка"));
+        assert_eq!(путь_внутри(&r), "CommonModules/Б/Ext/Module.bsl");
+        assert_eq!(расширение_пути("CommonModules/А/Ext/Module.bsl"), None);
+        assert_eq!(путь_внутри("CommonModules/А"), "CommonModules/А");
+    }
 }
