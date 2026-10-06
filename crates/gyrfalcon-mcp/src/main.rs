@@ -92,8 +92,9 @@ fn print_help() {
                       [--semantic-cache-mb 1536]
                                        держать векторы смыслового поиска в памяти
                                        (потолок на все индексы; 0 — читать с диска каждый раз)
-                      [--http [--port 8788] [--bind 127.0.0.1]]
-                                       транспорт Streamable HTTP вместо stdio
+                      [--http [--port 8788] [--bind 127.0.0.1] [--workers 4]]
+                                       транспорт Streamable HTTP вместо stdio;
+                                       --workers — сколько запросов обслуживать одновременно
                       MCP-сервер (по умолчанию stdio — для клиента вроде Claude Code)
   ui --db <файл.db> [--port 8787]
                       визуальная карта: движения, подсистемы, расширения
@@ -591,6 +592,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     let mut http = false;
     let mut port: Option<u16> = None;
     let mut bind: Option<String> = None;
+    let mut workers: Option<usize> = None;
     // Векторы смыслового поиска в памяти. Включено для сервера и только для
     // него: он живёт долго, и перечитывать 580 тысяч векторов на каждый
     // `find` (1,4 из 1,8 с, замер 01.10.2026) дороже, чем держать их.
@@ -629,6 +631,15 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                 i += 1;
                 bind = Some(args.get(i).ok_or("--bind без значения")?.clone());
             }
+            "--workers" => {
+                i += 1;
+                workers = Some(
+                    args.get(i)
+                        .ok_or("--workers без значения")?
+                        .parse()
+                        .map_err(|_| "--workers: не число")?,
+                );
+            }
             "--semantic-cache-mb" => {
                 i += 1;
                 semantic_cache_mb = args
@@ -655,15 +666,22 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                 .into(),
         );
     }
+    if workers.is_some() && !http {
+        return Err(
+            "--workers без --http: транспорт stdio обслуживает одного клиента. \
+             Нужен HTTP — добавьте --http"
+                .into(),
+        );
+    }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
     gyrfalcon_index::semantic::set_cache_limit(semantic_cache_mb);
-    let mut сервер =
-        server::Server::new(источник, profile).с_автодосборкой(auto_update);
+    let сервер = server::Server::new(источник, profile).с_автодосборкой(auto_update);
     if http {
         mcp_http::serve(
             сервер,
             bind.as_deref().unwrap_or(mcp_http::ПЕТЛЯ),
             port.unwrap_or(mcp_http::ПОРТ),
+            workers.unwrap_or(mcp_http::ПОТОКОВ),
         )
     } else {
         сервер.run().map_err(|e| e.to_string())
