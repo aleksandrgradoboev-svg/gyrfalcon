@@ -156,9 +156,12 @@ pub const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "overrides",
-        description: "Перехваты расширений с АДРЕСОМ: что перехвачено, каким расширением, \
-             аннотацией (Перед/После/Вместо/ИзменениеИКонтроль), в каком модуле расширения \
-             и на какой строке. Отвечает на «почему типовой код ведёт себя не как типовой».",
+        description: "Расширения конфигурации. Без параметров — все расширения: перехватов, \
+             своих объектов, заимствовано, модулей. По extension — перехваты И состав расширения \
+             (свои и заимствованные объекты). По object — перехваты с АДРЕСОМ: аннотация \
+             (Перед/После/Вместо/ИзменениеИКонтроль), модуль расширения, строка. Отвечает на \
+             «почему типовой код ведёт себя не как типовой». Код и объекты расширений \
+             ищутся обычными find/object/read/callers, путь — ../ext/<Имя>/….",
         schema: schema_overrides,
     },
     Tool {
@@ -1335,20 +1338,77 @@ fn overrides(conn: &Connection, args: &Value) -> Result<Value, String> {
              FROM extension_overrides WHERE object_name LIKE ?1 COLLATE NOCASE",
             &[&format!("%{o}%")],
         ),
-        (None, Some(e)) => выборка(
-            conn,
-            "SELECT object_name, target_method, annotation, extension_name, extension_purpose,
-                    ext_module_path, ext_line
-             FROM extension_overrides WHERE extension_name LIKE ?1 COLLATE NOCASE",
-            &[&format!("%{e}%")],
-        ),
-        (None, None) => выборка(
-            conn,
-            "SELECT extension_name, extension_purpose, count(*) AS перехватов
-             FROM extension_overrides GROUP BY extension_name, extension_purpose",
-            &[],
-        ),
+        (None, Some(e)) => {
+            let перехваты = выборка(
+                conn,
+                "SELECT object_name, target_method, annotation, extension_name, extension_purpose,
+                        ext_module_path, ext_line
+                 FROM extension_overrides WHERE extension_name LIKE ?1 COLLATE NOCASE",
+                &[&format!("%{e}%")],
+            )?;
+            // «Всё, что делает расширение» — это и его собственные объекты, а
+            // не только перехваты (Р-022). На индексе схемы 3 состава нет —
+            // так и говорим, а не отдаём перехваты за полный ответ.
+            if !есть_таблица(conn, "extension_objects") {
+                return Ok(json!({
+                    "overrides": перехваты,
+                    "objects": null,
+                    "note": "индекс собран до Р-022 (схема < 4): собственные объекты и код \
+                             расширений в нём не индексированы — пересоберите индекс"
+                }));
+            }
+            let объекты = выборка(
+                conn,
+                "SELECT extension_name, category, object_name, belonging, source_file
+                 FROM extension_objects WHERE extension_name LIKE ?1 COLLATE NOCASE
+                 ORDER BY extension_name, belonging DESC, category, object_name",
+                &[&format!("%{e}%")],
+            )?;
+            Ok(json!({
+                "overrides": перехваты,
+                "objects": объекты,
+                "note": "belonging: own — объект расширения; adopted — заимствован, его \
+                         свойства в индексе от основной конфигурации плюс добавленное расширением. \
+                         Код расширения адресуется путём ../ext/<Имя>/… в find/read/callers"
+            }))
+        }
+        (None, None) => {
+            if !есть_таблица(conn, "extensions") {
+                return выборка(
+                    conn,
+                    "SELECT extension_name, extension_purpose, count(*) AS перехватов
+                     FROM extension_overrides GROUP BY extension_name, extension_purpose",
+                    &[],
+                );
+            }
+            // Все расширения, а не только с перехватами: прежняя выборка шла
+            // по `extension_overrides`, и расширение без перехвата в списке
+            // отсутствовало — на ДО два из девяти.
+            выборка(
+                conn,
+                "SELECT e.name, e.purpose,
+                        (SELECT count(*) FROM extension_overrides o WHERE o.extension_name = e.name) AS перехватов,
+                        (SELECT count(*) FROM extension_objects x
+                          WHERE x.extension_name = e.name AND x.belonging = 'own') AS своих_объектов,
+                        (SELECT count(*) FROM extension_objects x
+                          WHERE x.extension_name = e.name AND x.belonging = 'adopted') AS заимствовано,
+                        (SELECT count(*) FROM modules m WHERE m.rel_path LIKE e.rel_root || '/%') AS модулей
+                 FROM extensions e ORDER BY e.name",
+                &[],
+            )
+        }
     }
+}
+
+/// Есть ли таблица в индексе: новые таблицы появляются с версией схемы,
+/// а читать приходится и индексы, собранные раньше.
+fn есть_таблица(conn: &Connection, имя: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [имя],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 fn movements(conn: &Connection, args: &Value) -> Result<Value, String> {
@@ -1443,6 +1503,80 @@ fn coverage(conn: &Connection) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Расширение без перехватов обязано быть в списке (Р-022).
+    ///
+    /// Прежде список шёл по `extension_overrides`, и на ДО два расширения
+    /// из девяти в нём отсутствовали — их собственный код был невидим.
+    #[test]
+    fn список_расширений_включает_расширение_без_перехватов() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_EXTENSIONS)
+            .unwrap();
+        c.execute_batch(
+            "INSERT INTO extensions (name, purpose, name_prefix, rel_root) VALUES
+               ('Перехватчик','Patch',NULL,'../ext/Перехватчик'),
+               ('СвойКод','Customization','Св_','../ext/СвойКод');
+             INSERT INTO extension_overrides (object_name, target_method, annotation,
+                 extension_name, extension_root, ext_module_path, ext_line)
+               VALUES ('Товар','ПриЗаписи','После','Перехватчик','x','Catalogs/Товар/Ext/ObjectModule.bsl',1);
+             INSERT INTO extension_objects VALUES
+               ('СвойКод','CommonModules','Св_Сервис','own','../ext/СвойКод/CommonModules/Св_Сервис.xml'),
+               ('СвойКод','Catalogs','Товар','adopted','../ext/СвойКод/Catalogs/Товар.xml');
+             INSERT INTO modules (id, rel_path, category, object_name, module_type, is_form, size)
+               VALUES (1,'../ext/СвойКод/CommonModules/Св_Сервис/Ext/Module.bsl',
+                       'CommonModules','Св_Сервис','Module',0,10);",
+        )
+        .unwrap();
+
+        let r = call(&c, Profile::All, "overrides", &json!({})).unwrap();
+        let строки = r["rows"].as_array().unwrap();
+        assert_eq!(строки.len(), 2, "{r}");
+        let свой = строки
+            .iter()
+            .find(|s| s[0] == "СвойКод")
+            .expect("расширение без перехватов пропало из списка");
+        // перехватов, своих объектов, заимствовано, модулей
+        assert_eq!(
+            (&свой[2], &свой[3], &свой[4], &свой[5]),
+            (&json!(0), &json!(1), &json!(1), &json!(1))
+        );
+
+        let r = call(
+            &c,
+            Profile::All,
+            "overrides",
+            &json!({"extension": "СвойКод"}),
+        )
+        .unwrap();
+        assert_eq!(r["objects"]["rows"].as_array().unwrap().len(), 2, "{r}");
+    }
+
+    /// Индекс до Р-022: таблиц реестра нет — прежний ответ, а не падение,
+    /// и честная пометка, что состава расширения в индексе нет.
+    #[test]
+    fn расширения_на_индексе_старой_схемы() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE extension_overrides (object_name TEXT, target_method TEXT,
+               annotation TEXT, extension_name TEXT, extension_purpose TEXT,
+               ext_module_path TEXT, ext_line INTEGER, target_method_line INTEGER);
+             INSERT INTO extension_overrides VALUES ('Товар','ПриЗаписи','После','Старое',NULL,'m',1,2);",
+        )
+        .unwrap();
+        let r = call(&c, Profile::All, "overrides", &json!({})).unwrap();
+        assert_eq!(r["rows"].as_array().unwrap().len(), 1, "{r}");
+        let r = call(
+            &c,
+            Profile::All,
+            "overrides",
+            &json!({"extension": "Старое"}),
+        )
+        .unwrap();
+        assert!(r["objects"].is_null(), "{r}");
+        assert!(r["note"].as_str().unwrap().contains("пересоберите"), "{r}");
+    }
 
     /// База с объектом БЕЗ реквизитов — тот случай, на котором ломался поиск.
     ///

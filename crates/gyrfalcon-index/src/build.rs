@@ -90,6 +90,15 @@ pub struct BuildReport {
     pub extension_unresolved: u64,
     /// Найдено расширений — знаменатель для перехватов.
     pub extensions: u64,
+    /// Модули расширений, записанные в `modules` наравне с основными (Р-022).
+    pub extension_modules: u64,
+    /// Объекты в составе расширений — свои и заимствованные (`extension_objects`).
+    pub extension_objects: u64,
+    /// Строки расширений, отброшенные как повтор основной конфигурации:
+    /// заимствованные реквизиты, элементы заимствованных форм, права.
+    /// Считается отдельно, чтобы «записали меньше» читалось как «не задвоили»,
+    /// а не как потеря.
+    pub extension_duplicates: u64,
     /// XML, которые не удалось разобрать. Отдельно от модулей: это разные корпуса.
     pub meta_unreadable: u64,
     pub meta_ms: u64,
@@ -134,13 +143,19 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     let extra_help_sources = old_help.extra_sources();
 
     // --- обход ---
+    //
+    // Корни — основная конфигурация и каждое расширение (Р-022). Основная
+    // идёт первой: при совпадении имён адресатом вызова остаётся её объект.
     let t = Instant::now();
-    let paths = gyrfalcon_parser::scan::collect_modules(src);
-    report.walk_ms = t.elapsed().as_millis() as u64;
-
+    let корни = extensions::корни(src);
+    let mut paths = gyrfalcon_parser::scan::collect_modules(src);
     if paths.is_empty() {
         return Err(IndexError::NoModules(src.display().to_string()));
     }
+    for к in корни.iter().filter(|к| к.extension.is_some()) {
+        paths.extend(gyrfalcon_parser::scan::collect_modules(&к.dir));
+    }
+    report.walk_ms = t.elapsed().as_millis() as u64;
 
     // --- проход 1: разбор параллельно по ядрам ---
     let t = Instant::now();
@@ -151,6 +166,7 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     report.parse_ms = t.elapsed().as_millis() as u64;
 
     report.files_unreadable = paths.len() as u64 - parsed.len() as u64;
+    report.extension_modules = parsed.iter().filter(|m| из_расширения(&m.rel_path)).count() as u64;
     report.files_with_parse_errors = parsed.iter().filter(|m| m.parsed.has_errors).count() as u64;
 
     // --- запись модулей, методов, областей ---
@@ -173,22 +189,24 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     // --- метаданные: разбор XML параллельно, запись одним потоком ---
     let t = Instant::now();
     conn.execute_batch(ddl::SCHEMA_META)?;
-    let из_разбора = write_metadata(&mut conn, src, &mut report)?;
+    // Таблицы расширений заводятся ДО метаданных: состав каждого расширения
+    // (`extension_objects`) пишется тем же проходом, что и сами объекты.
+    conn.execute_batch(ddl::SCHEMA_EXTENSIONS)?;
+    let из_разбора = write_metadata(&mut conn, src, &корни, &mut report)?;
     conn.execute_batch(ddl::SCHEMA_META2)?;
-    write_metadata2(&mut conn, src, &mut report)?;
+    write_metadata2(&mut conn, src, &корни, &mut report)?;
     conn.execute_batch(ddl::SCHEMA_INTEGRATION)?;
-    write_integration(&mut conn, src, &mut report)?;
+    write_integration(&mut conn, src, &корни, &mut report)?;
     // Упоминания пишутся ПОСЛЕ метаданных: они фильтруются по списку
     // существующих объектов, а он берётся из уже заполненных таблиц.
     conn.execute_batch(ddl::SCHEMA_USAGES)?;
     write_usages(&mut conn, &parsed, &mut report)?;
     conn.execute_batch(ddl::SCHEMA_FORMS)?;
-    write_forms(&mut conn, src, &mut report)?;
+    write_forms(&mut conn, src, &корни, &mut report)?;
     // Ссылки строятся ПОСЛЕ всех таблиц-источников: они читают их, а не файлы.
     // Перехваты расширений: читают уже записанные модули и методы основной
     // конфигурации, поэтому идут ПОСЛЕ них — резолвинг цели это SQL по
     // `modules`/`methods`, а не вторая карта в памяти.
-    conn.execute_batch(ddl::SCHEMA_EXTENSIONS)?;
     write_extensions(&mut conn, src, &mut report)?;
     conn.execute_batch(ddl::SCHEMA_REFS)?;
     write_references(&mut conn, из_разбора, &mut report)?;
@@ -280,20 +298,23 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     Ok(report)
 }
 
-pub(crate) fn read_and_parse(root: &Path, path: &PathBuf) -> Option<ModuleData> {
+/// Прочитать и разобрать модуль. `src` — корень ОСНОВНОЙ конфигурации.
+///
+/// Файл расширения лежит соседом `src` (Р-022): адрес у него `../ext/<Имя>/…`,
+/// а классифицируется он по пути внутри СВОЕЙ выгрузки — иначе `classify`
+/// принял бы `..` за категорию, и общий модуль расширения не стал бы общим.
+pub(crate) fn read_and_parse(src: &Path, path: &PathBuf) -> Option<ModuleData> {
     let raw = std::fs::read(path).ok()?;
     let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw);
     let source =
         нормализовать_переводы_строк(&String::from_utf8_lossy(raw));
 
-    let rel_path = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let корень = extensions::корень_файла(src, path).unwrap_or_else(|| src.to_path_buf());
+    let внутри = rel_of(&корень, path);
+    let rel_path = rel_of(src, path);
 
     Some(ModuleData {
-        info: classify::classify(&rel_path),
+        info: classify::classify(&внутри),
         size: raw.len() as u64,
         parsed: module::parse(&source).ok()?,
         rel_path,
@@ -427,18 +448,35 @@ fn write_modules(
             report.regions += m.parsed.regions.len() as u64;
 
             // Таблицы разрешения: адресуемые снаружи модули.
+            //
+            // Модуль расширения занимает имя, только если оно свободно:
+            // заимствованный общий модуль лежит в расширении под тем же
+            // именем, но адресат `ОбщийМодуль.Метод` — модуль основной
+            // конфигурации, а в расширении только его перехватчики. Основная
+            // записана раньше (порядок корней), поэтому «свободно» и значит
+            // «собственный объект расширения».
+            let из_расширения = extensions::расширение_пути(&m.rel_path).is_some();
             if classify::is_common_module(&m.info) {
                 if let Some(name) = &m.info.object_name {
-                    tables
-                        .common_modules
-                        .insert(name.to_lowercase(), (m.rel_path.clone(), own.clone()));
+                    let запись = (m.rel_path.clone(), own.clone());
+                    if из_расширения {
+                        tables
+                            .common_modules
+                            .entry(name.to_lowercase())
+                            .or_insert(запись);
+                    } else {
+                        tables.common_modules.insert(name.to_lowercase(), запись);
+                    }
                 }
             }
             if classify::is_manager_module(&m.info) {
                 if let Some(name) = &m.info.object_name {
-                    tables
-                        .managers
-                        .insert(name.to_lowercase(), (m.rel_path.clone(), own.clone()));
+                    let запись = (m.rel_path.clone(), own.clone());
+                    if из_расширения {
+                        tables.managers.entry(name.to_lowercase()).or_insert(запись);
+                    } else {
+                        tables.managers.insert(name.to_lowercase(), запись);
+                    }
                 }
             }
             for meth in &m.parsed.methods {
@@ -526,9 +564,13 @@ fn write_calls(
 fn write_metadata(
     conn: &mut Connection,
     src: &Path,
+    корни: &[extensions::Корень],
     report: &mut BuildReport,
 ) -> Result<Vec<refs::MetaRef>> {
-    let objects = meta::collect_objects(src);
+    let objects: Vec<(String, PathBuf)> = корни
+        .iter()
+        .flat_map(|к| meta::collect_objects(&к.dir))
+        .collect();
     if objects.is_empty() {
         // Выгрузка без единого объекта метаданных — не поломка: индекс могли
         // собрать по каталогу с одними модулями. Молчаливого нуля тут нет:
@@ -539,11 +581,7 @@ fn write_metadata(
     let parsed: Vec<(meta::MetaObject, Vec<meta::PredefinedItem>)> = objects
         .par_iter()
         .filter_map(|(cat, path)| {
-            let rel = path
-                .strip_prefix(src)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_of(src, path);
             let obj = meta::parse_object(path, cat, &rel)?;
             // Предопределённые лежат отдельным файлом рядом с объектом.
             // У плоского XML каталога-спутника нет — тогда их просто нет.
@@ -554,6 +592,31 @@ fn write_metadata(
         .collect();
 
     report.meta_unreadable = objects.len() as u64 - parsed.len() as u64;
+
+    // Ключи основной конфигурации — чтобы строка расширения, повторяющая
+    // оригинал, не легла второй (см. `без_повторов`). Пометка `Adopted`
+    // отсекает заимствованное по факту; ключ страхует случай, где выгрузка
+    // пометку не поставила.
+    let ключ_реквизита = |o: &meta::MetaObject, a: &meta::Attribute| {
+        format!(
+            "{}|{}|{}|{}|{}",
+            o.category,
+            o.name.to_lowercase(),
+            a.ts_name.as_deref().unwrap_or("").to_lowercase(),
+            a.name.to_lowercase(),
+            a.kind
+        )
+    };
+    let основные_реквизиты: std::collections::HashSet<String> = parsed
+        .iter()
+        .filter(|(o, _)| !из_расширения(&o.source_file))
+        .flat_map(|(o, _)| o.attributes.iter().map(move |a| ключ_реквизита(o, a)))
+        .collect();
+    let основной_состав: std::collections::HashSet<(String, String)> = parsed
+        .iter()
+        .filter(|(o, _)| !из_расширения(&o.source_file) && o.category == "Subsystems")
+        .flat_map(|(o, _)| o.content.iter().map(move |r| (o.name.clone(), r.clone())))
+        .collect();
 
     let tx = conn.transaction()?;
     {
@@ -586,9 +649,42 @@ fn write_metadata(
             "INSERT INTO subsystem_content (subsystem_name, subsystem_synonym, object_ref, file)
              VALUES (?1,?2,?3,?4)",
         )?;
+        let mut ins_eo = tx.prepare(
+            "INSERT INTO extension_objects
+             (extension_name, category, object_name, belonging, source_file)
+             VALUES (?1,?2,?3,?4,?5)",
+        )?;
 
+        let mut объектов: u64 = 0;
         for (obj, pre) in &parsed {
+            // Заимствованный объект — не новый объект: его синоним, состав
+            // перечисления и предопределённые уже записаны из основной
+            // конфигурации. От него в индекс идёт только добавленное.
+            let заимствован = из_расширения(&obj.source_file) && obj.adopted;
+            if let Some(расширение) = extensions::расширение_пути(&obj.source_file)
+            {
+                ins_eo.execute(rusqlite::params![
+                    расширение,
+                    obj.category,
+                    obj.name,
+                    if obj.adopted { "adopted" } else { "own" },
+                    obj.source_file,
+                ])?;
+                report.extension_objects += 1;
+            }
+            if !заимствован {
+                объектов += 1;
+            }
+
             for a in &obj.attributes {
+                if из_расширения(&obj.source_file)
+                    && (a.adopted
+                        || основные_реквизиты.contains(&ключ_реквизита(obj, a)))
+                {
+                    report.extension_duplicates += 1;
+                    continue;
+                }
+                report.attributes += 1;
                 ins_attr.execute(rusqlite::params![
                     obj.name,
                     obj.category,
@@ -604,7 +700,36 @@ fn write_metadata(
                     a.date_fractions,
                 ])?;
             }
-            report.attributes += obj.attributes.len() as u64;
+
+            if заимствован {
+                // Подсистема и перечисление могут нести добавленное
+                // расширением — его записываем; остальное у оригинала.
+                if obj.category == "Subsystems" {
+                    for r in &obj.content {
+                        if основной_состав.contains(&(obj.name.clone(), r.clone())) {
+                            report.extension_duplicates += 1;
+                            continue;
+                        }
+                        ins_sc.execute(rusqlite::params![
+                            obj.name,
+                            obj.synonym,
+                            r,
+                            obj.source_file
+                        ])?;
+                        report.subsystem_content += 1;
+                    }
+                }
+                if obj.category == "Enums" && !obj.enum_values.is_empty() {
+                    ins_enum.execute(rusqlite::params![
+                        obj.name,
+                        obj.synonym,
+                        json_array(&obj.enum_values),
+                        obj.source_file,
+                    ])?;
+                    report.enum_values += obj.enum_values.len() as u64;
+                }
+                continue;
+            }
 
             if let Some(syn) = &obj.synonym {
                 ins_syn.execute(rusqlite::params![
@@ -671,11 +796,19 @@ fn write_metadata(
             }
             report.predefined += pre.len() as u64;
         }
-        report.meta_objects = parsed.len() as u64;
+        // Объектов — без заимствованных: они уже посчитаны в основной.
+        // На конфигурации без расширений число то же, что прежде.
+        report.meta_objects = объектов;
     }
     tx.commit()?;
 
-    Ok(refs::из_разбора(&parsed))
+    // Ссылки из разбора (ввод на основании, владельцы, формы по умолчанию)
+    // у заимствованного объекта повторяют ссылки оригинала.
+    let свои: Vec<(meta::MetaObject, Vec<meta::PredefinedItem>)> = parsed
+        .into_iter()
+        .filter(|(o, _)| !(из_расширения(&o.source_file) && o.adopted))
+        .collect();
+    Ok(refs::из_разбора(&свои))
 }
 
 /// Собрать пути объектов одной категории первого уровня: `<Категория>/<Имя>.xml`.
@@ -726,43 +859,111 @@ fn companion_files(src: &Path, category: &str, rel_tail: &str) -> Vec<(String, P
 }
 
 /// Путь относительно корня выгрузки, разделителем `/` — формат прежнего инструмента.
+///
+/// Файл расширения получает адрес `../ext/<Имя>/…` (см. `extensions::rel_from`).
 fn rel_of(src: &Path, path: &Path) -> String {
-    path.strip_prefix(src)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    extensions::rel_from(src, path)
+}
+
+/// Строка пришла из расширения — по адресу её файла.
+fn из_расширения(file: &str) -> bool {
+    file.starts_with("../")
+}
+
+/// Убрать из строк расширений те, что повторяют строку основной конфигурации.
+///
+/// Заимствованный объект лежит в выгрузке расширения вместе с тем, что
+/// расширению понадобилось от оригинала: роль — с правами, форма — со всеми
+/// элементами, подписка — целиком. Записать их ещё раз значит раздвоить
+/// каждый такой реквизит и элемент в выдаче, и раздвоение читалось бы как
+/// «их два». Остаётся только добавленное расширением. Сравнение — по ключу
+/// содержания, без файла: файл у копии другой по определению.
+fn без_повторов<T>(
+    rows: Vec<T>,
+    file: impl Fn(&T) -> &str,
+    key: impl Fn(&T) -> String,
+    отброшено: &mut u64,
+) -> Vec<T> {
+    let основные: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|r| !из_расширения(file(r)))
+        .map(&key)
+        .collect();
+    let до = rows.len();
+    let out: Vec<T> = rows
+        .into_iter()
+        .filter(|r| !из_расширения(file(r)) || !основные.contains(&key(r)))
+        .collect();
+    *отброшено += (до - out.len()) as u64;
+    out
 }
 
 /// Записать вторую часть метаданных вехи 3.
 ///
 /// Разбор параллельный, запись одним потоком — как в первой части (решение
 /// Р-004): пять корпусов независимы, и ждать друг друга им незачем.
-fn write_metadata2(conn: &mut Connection, src: &Path, report: &mut BuildReport) -> Result<()> {
-    let subs: Vec<meta2::EventSubscription> = category_files(src, "EventSubscriptions")
+fn write_metadata2(
+    conn: &mut Connection,
+    src: &Path,
+    корни: &[extensions::Корень],
+    report: &mut BuildReport,
+) -> Result<()> {
+    // Файлы — по всем корням; адрес — от `src` (у расширения `../ext/…`).
+    let файлы = |кат: &str| -> Vec<(String, PathBuf)> {
+        корни
+            .iter()
+            .flat_map(|к| category_files(&к.dir, кат))
+            .collect()
+    };
+    let спутники = |кат: &str, хвост: &str| -> Vec<(String, PathBuf)> {
+        корни
+            .iter()
+            .flat_map(|к| companion_files(&к.dir, кат, хвост))
+            .collect()
+    };
+    let mut повторы = 0u64;
+
+    let subs: Vec<meta2::EventSubscription> = файлы("EventSubscriptions")
         .par_iter()
         .filter_map(|(_, p)| meta2::parse_event_subscription(p, &rel_of(src, p)))
         .collect();
+    let subs = без_повторов(subs, |s| &s.file, |s| s.name.to_lowercase(), &mut повторы);
 
-    let jobs: Vec<meta2::ScheduledJob> = category_files(src, "ScheduledJobs")
+    let jobs: Vec<meta2::ScheduledJob> = файлы("ScheduledJobs")
         .par_iter()
         .filter_map(|(_, p)| meta2::parse_scheduled_job(p, &rel_of(src, p)))
         .collect();
+    let jobs = без_повторов(jobs, |j| &j.file, |j| j.name.to_lowercase(), &mut повторы);
 
-    let opts: Vec<meta2::FunctionalOption> = category_files(src, "FunctionalOptions")
+    let opts: Vec<meta2::FunctionalOption> = файлы("FunctionalOptions")
         .par_iter()
         .filter_map(|(_, p)| meta2::parse_functional_option(p, &rel_of(src, p)))
         .collect();
+    let opts = без_повторов(opts, |o| &o.file, |o| o.name.to_lowercase(), &mut повторы);
 
-    let rights: Vec<meta2::RoleRight> = companion_files(src, "Roles", "Ext/Rights.xml")
+    let rights: Vec<meta2::RoleRight> = спутники("Roles", "Ext/Rights.xml")
         .par_iter()
         .flat_map(|(role, p)| meta2::parse_role_rights(p, role, &rel_of(src, p)))
         .collect();
+    let rights = без_повторов(
+        rights,
+        |r| &r.file,
+        |r| format!("{}|{}|{}", r.role_name, r.object_name, r.right_name).to_lowercase(),
+        &mut повторы,
+    );
 
     let content: Vec<meta2::ExchangeContentItem> =
-        companion_files(src, "ExchangePlans", "Ext/Content.xml")
+        спутники("ExchangePlans", "Ext/Content.xml")
             .par_iter()
             .flat_map(|(plan, p)| meta2::parse_exchange_content(p, plan, &rel_of(src, p)))
             .collect();
+    let content = без_повторов(
+        content,
+        |c| &c.path,
+        |c| format!("{}|{}", c.plan_name, c.object_ref).to_lowercase(),
+        &mut повторы,
+    );
+    report.extension_duplicates += повторы;
 
     let tx = conn.transaction()?;
     {
@@ -865,33 +1066,62 @@ fn write_metadata2(conn: &mut Connection, src: &Path, report: &mut BuildReport) 
 /// добавлен: он требует прохода по телам модулей и приедет вместе с
 /// `metadata_code_usages`, где модули и так читаются. Столбец `source` заведён
 /// сразу, чтобы дописать классы, а не менять схему.
-fn write_integration(conn: &mut Connection, src: &Path, report: &mut BuildReport) -> Result<()> {
-    let movements: Vec<integration::RegisterMovement> = category_files(src, "Documents")
+fn write_integration(
+    conn: &mut Connection,
+    src: &Path,
+    корни: &[extensions::Корень],
+    report: &mut BuildReport,
+) -> Result<()> {
+    let файлы = |кат: &str| -> Vec<(String, PathBuf)> {
+        корни
+            .iter()
+            .flat_map(|к| category_files(&к.dir, кат))
+            .collect()
+    };
+    let mut повторы = 0u64;
+
+    // Документ расширения пишет в регистры — это его движения, и без них
+    // вопрос «кто пишет в регистр» на доработанной базе отвечает неполно.
+    let movements: Vec<integration::RegisterMovement> = файлы("Documents")
         .par_iter()
         .flat_map(|(name, p)| integration::parse_declared_movements(p, name, &rel_of(src, p)))
         .collect();
+    let movements = без_повторов(
+        movements,
+        |m| &m.file,
+        |m| format!("{}|{}|{}", m.document_name, m.register_name, m.source).to_lowercase(),
+        &mut повторы,
+    );
 
-    let packages: Vec<integration::XdtoPackage> = category_files(src, "XDTOPackages")
+    let packages: Vec<integration::XdtoPackage> = файлы("XDTOPackages")
         .par_iter()
-        .filter_map(|(name, p)| {
-            let bin = src
-                .join("XDTOPackages")
-                .join(name)
-                .join("Ext")
-                .join("Package.bin");
+        .filter_map(|(_, p)| {
+            // Пакет лежит каталогом-спутником рядом со своим XML — в том же
+            // корне, где найден, а не обязательно в основной конфигурации.
+            let bin = p.with_extension("").join("Ext").join("Package.bin");
             integration::parse_xdto_package(p, &bin, &rel_of(src, p))
         })
         .collect();
+    let packages = без_повторов(
+        packages,
+        |p| &p.file,
+        |p| p.name.to_lowercase(),
+        &mut повторы,
+    );
 
-    let webs: Vec<integration::WebService> = category_files(src, "WebServices")
+    let webs: Vec<integration::WebService> = файлы("WebServices")
         .par_iter()
         .filter_map(|(_, p)| integration::parse_web_service(p, &rel_of(src, p)))
         .collect();
+    let webs = без_повторов(webs, |s| &s.file, |s| s.name.to_lowercase(), &mut повторы);
 
-    let https: Vec<integration::HttpService> = category_files(src, "HTTPServices")
+    let https: Vec<integration::HttpService> = файлы("HTTPServices")
         .par_iter()
         .filter_map(|(_, p)| integration::parse_http_service(p, &rel_of(src, p)))
         .collect();
+    let https =
+        без_повторов(https, |s| &s.file, |s| s.name.to_lowercase(), &mut повторы);
+    report.extension_duplicates += повторы;
 
     let tx = conn.transaction()?;
     {
@@ -1233,14 +1463,44 @@ fn form_files(src: &Path) -> Vec<(String, String, String, PathBuf)> {
 /// Разбор параллельный, запись одним потоком (Р-004). Формы — самый крупный
 /// корпус XML после модулей: 7 890 файлов, и разбирать их последовательно
 /// значило бы отдать выигрыш по ядрам даром.
-fn write_forms(conn: &mut Connection, src: &Path, report: &mut BuildReport) -> Result<()> {
-    let файлы = form_files(src);
+fn write_forms(
+    conn: &mut Connection,
+    src: &Path,
+    корни: &[extensions::Корень],
+    report: &mut BuildReport,
+) -> Result<()> {
+    let файлы: Vec<(String, String, String, PathBuf)> =
+        корни.iter().flat_map(|к| form_files(&к.dir)).collect();
     let элементы: Vec<forms::FormElement> = файлы
         .par_iter()
         .flat_map(|(объект, категория, форма, путь)| {
             forms::parse_form(путь, объект, категория, форма, &rel_of(src, путь))
         })
         .collect();
+    // Заимствованная форма выгружается в расширение целиком, с элементами
+    // оригинала. Остаются только добавленные расширением элементы.
+    let mut повторы = 0u64;
+    let элементы = без_повторов(
+        элементы,
+        |e| &e.file,
+        |e| {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}",
+                e.category,
+                e.object_name,
+                e.form_name,
+                e.kind,
+                e.scope,
+                e.element_name,
+                e.event,
+                e.handler,
+                e.data_path
+            )
+            .to_lowercase()
+        },
+        &mut повторы,
+    );
+    report.extension_duplicates += повторы;
 
     let tx = conn.transaction()?;
     {
@@ -1338,7 +1598,7 @@ fn json_array(items: &[String]) -> String {
 }
 
 fn write_meta(conn: &Connection, src: &Path, report: &BuildReport) -> Result<()> {
-    let pairs: [(&str, String); 16] = [
+    let pairs: [(&str, String); 19] = [
         ("builder", "gyrfalcon".into()),
         // Версия ПРОГРАММЫ и версия СХЕМЫ — разные вещи, и пишутся обе.
         // Правка кода без правки таблиц не делает индекс несовместимым.
@@ -1368,6 +1628,12 @@ fn write_meta(conn: &Connection, src: &Path, report: &BuildReport) -> Result<()>
             "subsystem_content_count",
             report.subsystem_content.to_string(),
         ),
+        // Р-022: расширения в индексе целиком. Ноль модулей при ненулевом
+        // числе расширений — признак, что их код не попал, и он виден здесь,
+        // а не только по пустому ответу на поиск.
+        ("extensions", report.extensions.to_string()),
+        ("extension_modules", report.extension_modules.to_string()),
+        ("extension_objects", report.extension_objects.to_string()),
     ];
     for (k, v) in pairs {
         conn.execute(
@@ -1472,6 +1738,28 @@ fn write_extensions(conn: &mut Connection, src: &Path, report: &mut BuildReport)
     report.extensions = расширения.len() as u64;
     if расширения.is_empty() {
         return Ok(());
+    }
+
+    // Реестр расширений — ВСЕ, а не только те, у кого есть перехваты.
+    // Прежде расширение без перехвата не существовало для индекса вовсе:
+    // на ДО два из девяти, и «что делает это расширение» отвечало пустотой.
+    {
+        let tx = conn.transaction()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO extensions (name, purpose, name_prefix, rel_root)
+                 VALUES (?1,?2,?3,?4)",
+            )?;
+            for e in &расширения {
+                ins.execute(rusqlite::params![
+                    e.name,
+                    e.purpose,
+                    e.name_prefix,
+                    rel_of(src, &e.root),
+                ])?;
+            }
+        }
+        tx.commit()?;
     }
 
     // Разбор по расширениям параллельно: их немного, но модулей внутри
@@ -1908,6 +2196,165 @@ mod tests {
             "{:?}",
             r.stats
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn записать(p: &Path, текст: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, текст).unwrap();
+    }
+
+    /// Справочник в форме выгрузки. `заимствован` — пометки расширения:
+    /// у объекта и у каждого реквизита из `чужие`; реквизиты из `свои` — без неё.
+    fn справочник(
+        имя: &str, заимствован: bool, чужие: &[&str], свои: &[&str]
+    ) -> String {
+        let метка = |да: bool| {
+            if да {
+                "<ObjectBelonging>Adopted</ObjectBelonging>"
+            } else {
+                ""
+            }
+        };
+        let mut реквизиты = String::new();
+        for (r, да) in чужие
+            .iter()
+            .map(|r| (r, true))
+            .chain(свои.iter().map(|r| (r, false)))
+        {
+            реквизиты.push_str(&format!(
+                "<Attribute uuid=\"1\"><Properties>{}<Name>{r}</Name></Properties></Attribute>",
+                метка(заимствован && да)
+            ));
+        }
+        format!(
+            "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\"><Catalog uuid=\"0\">\
+             <Properties>{}<Name>{имя}</Name></Properties>\
+             <ChildObjects>{реквизиты}</ChildObjects></Catalog></MetaDataObject>",
+            метка(заимствован)
+        )
+    }
+
+    /// Проект с расширениями соседями `src`: `<проект>/src` и `<проект>/ext/<Имя>`.
+    fn проект_с_расширениями(dir: &Path) -> PathBuf {
+        let src = dir.join("src");
+        корпус(&src);
+        записать(
+            &src.join("Catalogs/Товар.xml"),
+            &справочник("Товар", false, &[], &["Артикул", "Цена"]),
+        );
+
+        // Расширение с собственным кодом и заимствованиями, БЕЗ перехватов:
+        // до Р-022 его для индекса не существовало вовсе.
+        let ext = dir.join("ext/Доработка");
+        записать(
+            &ext.join("Configuration.xml"),
+            "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\"><Configuration>\
+             <Properties><ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>\
+             <NamePrefix>Дор_</NamePrefix></Properties></Configuration></MetaDataObject>",
+        );
+        // Собственный общий модуль, вызывающий общий модуль основной конфигурации.
+        записать(
+            &ext.join("CommonModules/Дор_Сервис/Ext/Module.bsl"),
+            "Процедура Выполнить() Экспорт\n\tОбщегоНазначения.ЗначениеРеквизита(1);\nКонецПроцедуры\n",
+        );
+        // Заимствованный общий модуль с тем же именем, что в основной.
+        записать(
+            &ext.join("CommonModules/ОбщегоНазначения/Ext/Module.bsl"),
+            "Процедура Дор_Вспомогательная()\nКонецПроцедуры\n",
+        );
+        // Заимствованный справочник: один реквизит оригинала + один свой.
+        записать(
+            &ext.join("Catalogs/Товар.xml"),
+            &справочник("Товар", true, &["Артикул"], &["Дор_Поставщик"]),
+        );
+        src
+    }
+
+    #[test]
+    fn расширение_индексируется_целиком_без_задвоений() {
+        let dir = std::env::temp_dir().join("gyrfalcon-build-ext");
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = проект_с_расширениями(&dir);
+        let db = dir.join("index.db");
+        let r = build(&src, &db, None).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let число = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+        // Код расширения — в modules, адрес от src через `../`.
+        assert_eq!(r.extension_modules, 2);
+        assert_eq!(
+            число(
+                "SELECT count(*) FROM modules WHERE category='CommonModules'
+                   AND rel_path='../ext/Доработка/CommonModules/Дор_Сервис/Ext/Module.bsl'"
+            ),
+            1,
+            "собственный модуль расширения классифицирован по пути внутри своей выгрузки"
+        );
+
+        // Вызов из расширения ушёл в модуль ОСНОВНОЙ конфигурации, а не
+        // в одноимённый заимствованный.
+        let адресат: String = conn
+            .query_row(
+                "SELECT c.callee_key FROM calls c JOIN methods m ON m.id=c.caller_id
+                  WHERE m.name='Выполнить'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            адресат,
+            "CommonModules/ОбщегоНазначения/Ext/Module.bsl::значениереквизита"
+        );
+
+        // Заимствованный реквизит не задвоен, свой — добавлен.
+        let реквизиты = |имя: &str| {
+            число(&format!(
+                "SELECT count(*) FROM object_attributes WHERE object_name='Товар' AND attr_name='{имя}'"
+            ))
+        };
+        assert_eq!(
+            реквизиты("Артикул"),
+            1,
+            "заимствованный реквизит раздвоился"
+        );
+        assert_eq!(
+            реквизиты("Дор_Поставщик"),
+            1,
+            "свой реквизит расширения потерян"
+        );
+        assert_eq!(
+            число("SELECT count(*) FROM object_synonyms WHERE object_name='Товар'"),
+            число("SELECT count(*) FROM object_synonyms WHERE object_name='Товар' AND file NOT LIKE '../%'"),
+            "заимствованный объект не должен давать второй строки синонима"
+        );
+
+        // Расширение без перехватов — в реестре; состав с принадлежностью.
+        assert_eq!(
+            число("SELECT count(*) FROM extensions WHERE name='Доработка'"),
+            1
+        );
+        assert_eq!(
+            число(
+                "SELECT count(*) FROM extension_objects
+                  WHERE object_name='Товар' AND belonging='adopted'"
+            ),
+            1
+        );
+        assert!(r.extension_duplicates >= 1, "{r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn без_расширений_сборка_прежняя() {
+        // Конфигурация без `ext/` обязана собираться ровно как до Р-022:
+        // ни лишних модулей, ни строк в таблицах расширений.
+        let dir = std::env::temp_dir().join("gyrfalcon-build-noext");
+        let _ = std::fs::remove_dir_all(&dir);
+        корпус(&dir);
+        let db = dir.join("index.db");
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!((r.modules, r.extension_modules, r.extensions), (2, 0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

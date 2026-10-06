@@ -58,6 +58,10 @@ pub struct Attribute {
     pub precision: Option<u32>,
     pub scale: Option<u32>,
     pub date_fractions: Option<String>,
+    /// Заимствован расширением из основной конфигурации (`ObjectBelonging =
+    /// Adopted`). Такой реквизит уже записан из основной конфигурации, и
+    /// повторная строка из расширения раздвоила бы его в выдаче.
+    pub adopted: bool,
 }
 
 /// Предопределённый элемент из `Ext/Predefined.xml`.
@@ -101,6 +105,10 @@ pub struct MetaObject {
     pub source_file: String,
     /// Разбор споткнулся. Не «файла нет» — именно XML оказался неразбираем.
     pub had_error: bool,
+    /// Объект заимствован расширением (`ObjectBelonging = Adopted`): в выгрузке
+    /// расширения лежит только то, что расширению нужно от оригинала, плюс
+    /// добавленное им самим. Свойства оригинала берутся из основной конфигурации.
+    pub adopted: bool,
 }
 
 /// Категории объектов метаданных.
@@ -339,7 +347,9 @@ pub fn parse_object(path: &Path, category: &str, rel_path: &str) -> Option<MetaO
                     }
                     "EnumValue" => {
                         if let Some(a) = cur.take() {
-                            if !a.name.is_empty() {
+                            // Заимствованное значение уже есть в перечислении
+                            // основной конфигурации; своё значение расширения — нет.
+                            if !a.name.is_empty() && !a.adopted {
                                 obj.enum_values.push(a.name);
                             }
                         }
@@ -384,6 +394,18 @@ pub fn parse_object(path: &Path, category: &str, rel_path: &str) -> Option<MetaO
                 }
 
                 match tag {
+                    // Принадлежность: только у расширения. Тег стоит у объекта,
+                    // у каждого заимствованного реквизита и у табличной части;
+                    // у своего, добавленного расширением, его нет вовсе. Пометка
+                    // табличной части не наследуется её реквизитами: у каждого
+                    // своя, и свой реквизит в заимствованной ТЧ законен.
+                    "ObjectBelonging" if txt == "Adopted" => {
+                        if let Some(a) = cur.as_mut() {
+                            a.adopted = true;
+                        } else if ts_name.is_none() {
+                            obj.adopted = true;
+                        }
+                    }
                     "Name" => {
                         if let Some(a) = cur.as_mut() {
                             if a.name.is_empty() {
