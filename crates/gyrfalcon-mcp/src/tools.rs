@@ -616,47 +616,65 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
         // книга» обязан находить `АдреснаяКнига`: пользователь 1С видит в
         // интерфейсе синоним, а не имя метаданных. Сигнала с таким смыслом
         // у прежнего инструмента нет — в его 158 языках у сущности одно имя.
+        // Сигнал «использование в коде» — НЕОБЯЗАТЕЛЬНЫЙ, но только в одном
+        // смысле: индекс, собранный до вехи 3, таблицы `metadata_code_usages`
+        // не содержит, и поиск обязан работать на нём без неё. Любая другая
+        // ошибка — громкая. Прежде запасной путь срабатывал на ЛЮБОЙ сбой
+        // prepare, и подзапрос по несуществующей колонке `metadata_name`
+        // с 0.1.0 молча обнулял сигнал на всех индексах.
+        let есть_упоминания: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                                WHERE type='table' AND name='metadata_code_usages')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        // Счёт — отдельным запросом по ключу, а не подзапросом в SQL: ключ в
+        // нижнем регистре, а `lower()` SQLite кириллицу не понижает.
+        let mut st_упоминания = if есть_упоминания {
+            Some(
+                conn.prepare("SELECT COUNT(*) FROM metadata_code_usages WHERE object_ref_key = ?1")
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
         let mut st = conn
             .prepare(
-                "SELECT s.object_name, s.category, COALESCE(s.synonym,''),
-                        (SELECT COUNT(*) FROM metadata_code_usages u
-                          WHERE u.metadata_name LIKE '%.' || s.object_name) AS usages
+                "SELECT s.object_name, s.category, COALESCE(s.synonym,'')
                  FROM object_synonyms s
                  WHERE s.object_name LIKE ?1 COLLATE NOCASE
                     OR s.synonym LIKE ?1 COLLATE NOCASE
                  UNION
-                 SELECT a.object_name, a.category, '', 0 FROM object_attributes a
+                 SELECT a.object_name, a.category, '' FROM object_attributes a
                  WHERE a.object_name LIKE ?1 COLLATE NOCASE
                  LIMIT ?2",
             )
-            // Сигнал «использование в коде» — НЕОБЯЗАТЕЛЬНЫЙ. Индекс, собранный
-            // до вехи 3, таблицы `metadata_code_usages` не содержит, и поиск
-            // обязан работать на нём без неё, а не падать: отсутствие сигнала
-            // не то же самое, что отсутствие ответа.
-            .or_else(|_| {
-                conn.prepare(
-                    "SELECT s.object_name, s.category, COALESCE(s.synonym,''), 0
-                     FROM object_synonyms s
-                     WHERE s.object_name LIKE ?1 COLLATE NOCASE
-                        OR s.synonym LIKE ?1 COLLATE NOCASE
-                     UNION
-                     SELECT a.object_name, a.category, '', 0 FROM object_attributes a
-                     WHERE a.object_name LIKE ?1 COLLATE NOCASE
-                     LIMIT ?2",
-                )
-            })
             .map_err(|e| e.to_string())?;
-        let rows = st
+        let rows: Vec<(String, String, String)> = st
             .query_map(rusqlite::params![&шаблон, широта], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1).unwrap_or_default(),
                     r.get::<_, String>(2).unwrap_or_default(),
-                    r.get::<_, i64>(3).unwrap_or(0),
                 ))
             })
-            .map_err(|e| e.to_string())?;
-        for (имя, кат, синоним, usages) in rows.flatten() {
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        for (имя, кат, синоним) in rows {
+            let usages: i64 = match (
+                st_упоминания.as_mut(),
+                gyrfalcon_index::build::ключ_упоминания(&кат, &имя),
+            ) {
+                (Some(st_u), Some(ключ)) => st_u
+                    .query_row([&ключ], |r| r.get(0))
+                    .map_err(|e| e.to_string())?,
+                // Категория, на которую в коде не ссылаются (общий модуль,
+                // функциональная опция), — ноль по существу, а не по сбою.
+                _ => 0,
+            };
             кандидаты.push(Candidate {
                 kind: "object".into(),
                 name: имя.clone(),
@@ -1431,6 +1449,60 @@ mod tests {
         assert!(
             имена.iter().any(|x| x == "РеализацияТоваровУслуг"),
             "объект С реквизитами потерян — добор из object_attributes сломан: {имена:?}"
+        );
+    }
+
+    /// Сигнал «использование в коде» обязан доходить до ранжирования.
+    ///
+    /// С 0.1.0 подзапрос обращался к колонке `metadata_name`, которой в
+    /// схеме нет; prepare падал, запасной путь отдавал `usage = 0`, и выдача
+    /// выглядела нормальной. Два документа с равным совпадением по имени —
+    /// упоминаемый в коде обязан стоять выше. Кириллица в имени нарочно:
+    /// `lower()` SQLite её не понижает.
+    #[test]
+    fn использование_в_коде_поднимает_объект() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_USAGES)
+            .unwrap();
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES
+               ('ЗаказА','Documents','','Documents/А.xml'),
+               ('ЗаказБ','Documents','','Documents/Б.xml');
+             INSERT INTO modules(id, rel_path, object_name, is_form) VALUES
+               (1, 'CommonModules/М/Module.bsl', 'М', 0);",
+        )
+        .unwrap();
+        for i in 0..5 {
+            c.execute(
+                "INSERT INTO metadata_code_usages
+                   (module_id, object_ref, object_ref_key, member_path, usage_kind, line)
+                 VALUES (1, 'Document.ЗаказБ', ?1, NULL, 'manager', ?2)",
+                rusqlite::params![
+                    gyrfalcon_index::build::ключ_упоминания("Documents", "ЗаказБ").unwrap(),
+                    i
+                ],
+            )
+            .unwrap();
+        }
+        let r = call(
+            &c,
+            Profile::All,
+            "find",
+            &json!({"query": "Заказ", "kind": "object", "semantic": false}),
+        )
+        .unwrap();
+        let имена: Vec<String> = r["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            имена.first().map(String::as_str),
+            Some("ЗаказБ"),
+            "упоминаемый в коде объект не поднялся — сигнал usage не дошёл: {имена:?}"
         );
     }
 
