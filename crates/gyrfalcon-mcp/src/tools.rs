@@ -640,20 +640,34 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
         } else {
             None
         };
+        // Порядок ДО лимита. Без него `LIMIT` брал первые строки в порядке
+        // таблицы, и главный объект отсекался раньше, чем доходил до
+        // ранжирования: на ЕРП.УХ запросу «Сотрудник» отвечают 539 объектов,
+        // справочник `Сотрудники` в первые 30 не попадал, и никакой сигнал
+        // не мог его поднять. Ключ дешёвый и грубый — точное имя, точный
+        // синоним, префикс, длина, — тонкую работу делает `rank`; задача
+        // ключа только не выбросить очевидного кандидата. `UNION` обёрнут
+        // в подзапрос: выражения в ORDER BY составного SELECT SQLite не берёт.
         let mut st = conn
             .prepare(
-                "SELECT s.object_name, s.category, COALESCE(s.synonym,'')
-                 FROM object_synonyms s
-                 WHERE s.object_name LIKE ?1 COLLATE NOCASE
-                    OR s.synonym LIKE ?1 COLLATE NOCASE
-                 UNION
-                 SELECT a.object_name, a.category, '' FROM object_attributes a
-                 WHERE a.object_name LIKE ?1 COLLATE NOCASE
+                "SELECT object_name, category, synonym FROM (
+                     SELECT s.object_name, s.category, COALESCE(s.synonym,'') AS synonym
+                     FROM object_synonyms s
+                     WHERE s.object_name LIKE ?1 COLLATE NOCASE
+                        OR s.synonym LIKE ?1 COLLATE NOCASE
+                     UNION
+                     SELECT a.object_name, a.category, '' FROM object_attributes a
+                     WHERE a.object_name LIKE ?1 COLLATE NOCASE)
+                 ORDER BY object_name = ?3 COLLATE NOCASE DESC,
+                          synonym = ?3 COLLATE NOCASE DESC,
+                          object_name LIKE ?3 || '%' DESC,
+                          synonym LIKE ?3 || '%' DESC,
+                          length(object_name)
                  LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
         let rows: Vec<(String, String, String)> = st
-            .query_map(rusqlite::params![&шаблон, широта], |r| {
+            .query_map(rusqlite::params![&шаблон, широта, &q], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1).unwrap_or_default(),
@@ -693,28 +707,51 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
     // 2. Методы. Степень связности берём из графа вызовов тем же запросом:
     //    часто вызываемый метод при прочих равных релевантнее одиночного.
     if kind == "any" || kind == "method" {
-        let mut st = conn
-            .prepare(
-                "SELECT m.name, m.type, m.is_export, mo.rel_path, m.line,
-                        (SELECT COUNT(*) FROM calls c
-                          WHERE c.callee_key = mo.rel_path || '::' || lower(m.name)) AS deg
-                 FROM methods m JOIN modules mo ON mo.id = m.module_id
-                 WHERE m.name LIKE ?1 COLLATE NOCASE LIMIT ?2",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = st
-            .query_map(rusqlite::params![&шаблон, широта], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1).unwrap_or_default(),
-                    r.get::<_, i64>(2).unwrap_or(0),
-                    r.get::<_, String>(3).unwrap_or_default(),
-                    r.get::<_, i64>(4).unwrap_or(0),
-                    r.get::<_, i64>(5).unwrap_or(0),
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        for (name, typ, exp, path, line, deg) in rows.flatten() {
+        // Точное имя — отдельным добором по индексу `idx_meth_name`, а не
+        // порядком в общей выборке. Порядок до лимита здесь пробовали
+        // (06.10.2026) и отвергли замером: на 750 тыс. методов ЕРП.УХ он
+        // убивает раннюю остановку `LIMIT` (+0,3 с на запрос), а ключ
+        // «короче — выше» вытесняет сигнал степени: на «При» наверх лезли
+        // `Принять` вместо `ПриСозданииНаСервере`. Добор стоит 1–10 мс и
+        // гарантирует ровно то, что терялось, — метод с названным именем.
+        //
+        // Добор идёт ВТОРЫМ запросом и дописывается в конец: при равных
+        // баллах `rank` сохраняет порядок поступления, и прежняя выборка
+        // обязана прийти первой и в прежнем порядке — иначе на частых словах
+        // менялась бы выдача, которую эта правка менять не собиралась
+        // (проверено A/B: объединение в одном запросе переставляло «При»).
+        const ВЫБОРКА: &str = "SELECT m.name, m.type, m.is_export, mo.rel_path, m.line,
+                    (SELECT COUNT(*) FROM calls c
+                      WHERE c.callee_key = mo.rel_path || '::' || lower(m.name)) AS deg
+             FROM methods m JOIN modules mo ON mo.id = m.module_id";
+        let mut строки: Vec<(String, String, i64, String, i64, i64)> = Vec::new();
+        let mut уже: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+        for (условие, образец) in [
+            ("WHERE m.name LIKE ?1 COLLATE NOCASE LIMIT ?2", &шаблон),
+            ("WHERE m.name = ?1 COLLATE NOCASE LIMIT ?2", &q),
+        ] {
+            let mut st = conn
+                .prepare(&format!("{ВЫБОРКА} {условие}"))
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map(rusqlite::params![образец, широта], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1).unwrap_or_default(),
+                        r.get::<_, i64>(2).unwrap_or(0),
+                        r.get::<_, String>(3).unwrap_or_default(),
+                        r.get::<_, i64>(4).unwrap_or(0),
+                        r.get::<_, i64>(5).unwrap_or(0),
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for строка in rows.flatten() {
+                if уже.insert((строка.3.clone(), строка.4)) {
+                    строки.push(строка);
+                }
+            }
+        }
+        for (name, typ, exp, path, line, deg) in строки {
             кандидаты.push(Candidate {
                 kind: "method".into(),
                 name: name.clone(),
@@ -737,11 +774,14 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
             .prepare(
                 "SELECT rel_path, category, object_name, module_type FROM modules
                  WHERE rel_path LIKE ?1 COLLATE NOCASE OR object_name LIKE ?1 COLLATE NOCASE
+                 ORDER BY object_name = ?3 COLLATE NOCASE DESC,
+                          object_name LIKE ?3 || '%' DESC,
+                          length(rel_path)
                  LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
-            .query_map(rusqlite::params![&шаблон, широта], |r| {
+            .query_map(rusqlite::params![&шаблон, широта, &q], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1).unwrap_or_default(),
@@ -811,7 +851,20 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
     if семантика || kind == "any" {
         for (табл, вид) in [("methods_fts", "method"), ("objects_fts", "object")] {
             let sql =
-                format!("SELECT name, bm25({табл}) FROM {табл} WHERE {табл} MATCH ?1 LIMIT ?2");
+                // Без `ORDER BY rank` FTS5 отдаёт первые строки по rowid,
+                // а `bm25()` лишь подписан к ним — лучшие по баллу могут не
+                // войти в выборку. У объектов порядок почти бесплатен; у
+                // методов на коротком частом слове стоит до +0,16 с (ЕРП.УХ,
+                // замер 06.10.2026), а главное, что терялось, — точное имя —
+                // там уже гарантирует добор. Компромисс записан в задаче.
+                if вид == "object" {
+                    format!(
+                        "SELECT name, bm25({табл}) FROM {табл} WHERE {табл} MATCH ?1
+                         ORDER BY rank LIMIT ?2"
+                    )
+                } else {
+                    format!("SELECT name, bm25({табл}) FROM {табл} WHERE {табл} MATCH ?1 LIMIT ?2")
+                };
             if let Ok(mut st) = conn.prepare(&sql) {
                 let rows = st.query_map(rusqlite::params![&q, широта], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1).unwrap_or(0.0)))
@@ -1504,6 +1557,65 @@ mod tests {
             Some("ЗаказБ"),
             "упоминаемый в коде объект не поднялся — сигнал usage не дошёл: {имена:?}"
         );
+    }
+
+    /// Главный кандидат не должен отсекаться лимитом выборки ДО ранжирования.
+    ///
+    /// На ЕРП.УХ запросу «Сотрудник» отвечают 539 объектов; выборка брала
+    /// первые 30 в порядке таблицы, и справочника `Сотрудники` в выдаче не
+    /// было вовсе — ни один сигнал не поднимет кандидата, которого нет.
+    /// Здесь 40 однокоренных имён стоят в таблице раньше главного, и оно
+    /// обязано найтись — и среди объектов, и среди методов.
+    #[test]
+    fn главный_кандидат_не_отсекается_до_ранжирования() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META).unwrap();
+        c.execute_batch("INSERT INTO modules(id, rel_path, object_name, is_form) VALUES (1, 'CommonModules/М/Module.bsl', 'М', 0);")
+            .unwrap();
+        for i in 0..40 {
+            c.execute(
+                "INSERT INTO object_synonyms (object_name, category, synonym, file)
+                 VALUES (?1, 'Catalogs', '', 'Catalogs/x.xml')",
+                [format!("СотрудникА{i:02}")],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO methods(module_id, name, type, line) VALUES (1, ?1, 'Procedure', ?2)",
+                rusqlite::params![format!("ПолучитьДанныеА{i:02}"), i],
+            )
+            .unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file)
+               VALUES ('Сотрудники', 'Catalogs', '', 'Catalogs/Сотрудники.xml');
+             INSERT INTO methods(module_id, name, type, line)
+               VALUES (1, 'ПолучитьДанные', 'Function', 100);",
+        )
+        .unwrap();
+
+        for (запрос, вид, главный) in [
+            ("Сотрудник", "object", "Сотрудники"),
+            ("ПолучитьДанные", "method", "ПолучитьДанные"),
+        ] {
+            let r = call(
+                &c,
+                Profile::All,
+                "find",
+                &json!({"query": запрос, "kind": вид, "limit": 10, "semantic": false}),
+            )
+            .unwrap();
+            let имена: Vec<String> = r["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s[0].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                имена.iter().any(|x| x == главный),
+                "{вид} «{главный}» отсечён до ранжирования: {имена:?}"
+            );
+        }
     }
 
     #[test]
