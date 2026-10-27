@@ -132,7 +132,9 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "object",
         description: "Карточка объекта метаданных: реквизиты с ТИПАМИ и квалификаторами, \
-             табличные части, синонимы, предопределённые, формы, движения по регистрам. \
+             табличные части, синонимы, предопределённые, формы, движения по регистрам, \
+             ввод на основании в обе стороны (based_on — на основании чего вводится \
+             объект, basis_for — что вводится на основании него). \
              Собирается из нескольких таблиц за один вызов — не нужно спрашивать по частям. \
              Объекта нет — found: false и похожие имена (similar), без пустых разделов; \
              пустой раздел существующего объекта назван в empty_parts.",
@@ -321,7 +323,7 @@ fn schema_object() -> Value {
             "category": {"type": "string", "description":
                 "Категория (Catalogs/Documents/…), если имя неоднозначно"},
             "parts": {"type": "array", "items": {"type": "string"}, "description":
-                "Что включить: attributes, synonyms, predefined, enum_values, movements, forms, rights, options, subscriptions, scheduled_jobs. \
+                "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, rights, options, subscriptions, scheduled_jobs. \
                  По умолчанию — всё, кроме forms (их бывает много)"}
         }),
         &["name"],
@@ -1070,6 +1072,138 @@ fn относится(путь: &str, полное: &str) -> bool {
             .is_some_and(|хвост| хвост.starts_with('.'))
 }
 
+/// Пометки к разделам ввода на основании — каждая про свой раздел и короткая:
+/// оба раздела в карточке по умолчанию, и общий абзац в обоих удваивал бы
+/// цену каждой карточки, даже пустой.
+const ПОМЕТКА_ОСНОВАНИЯ: &str =
+    "на основании чего вводится объект (свойство BasedOn); создание из кода не видно";
+const ПОМЕТКА_ВВОДИМЫХ: &str =
+    "что вводится на основании объекта (у них он в BasedOn); создание из кода не видно";
+
+/// Раздел, который индекс не может дать: таблицы нет. Без `count`, чтобы
+/// не попасть в `empty_parts` — «пусто» там значит факт о конфигурации.
+fn нет_таблицы(таблица: &str) -> Value {
+    json!({
+        "unavailable": true,
+        "note": format!("в индексе нет таблицы {таблица} — индекс старой схемы, пересоберите его"),
+    })
+}
+
+/// Полные имена (`Document.X`) объекта по его категориям; категории без
+/// вида (общие формы, расширения) пропускаются — полного имени у них нет.
+fn полные_имена<'a>(
+    категории: impl IntoIterator<Item = &'a str>,
+    имя: &str,
+) -> Vec<String> {
+    категории
+        .into_iter()
+        .filter_map(вид_объекта)
+        .map(|вид| format!("{вид}.{имя}"))
+        .collect()
+}
+
+/// Что вводится на основании объекта: у кого он стоит в «Ввод на основании».
+///
+/// В `metadata_references` ссылка пишется ПОЛНЫМ именем (`Document.X`), а
+/// источник — коротким с категорией; полное имя источника собирается той же
+/// функцией, что и у самого объекта, а не разбором `used_in`.
+fn вводимые_на_основании(
+    conn: &Connection,
+    полные: &[String],
+    тёзки: bool,
+) -> Result<Value, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT source_category, source_object FROM metadata_references
+             WHERE ref_kind = 'based_on' AND ref_object = ?1
+             ORDER BY source_category, source_object",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut строки = Vec::new();
+    for полное in полные {
+        let найдено = st
+            .query_map([полное], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for запись in найдено {
+            let (категория, имя) = запись.map_err(|e| e.to_string())?;
+            let вводимый = match вид_объекта(&категория) {
+                Some(вид) => format!("{вид}.{имя}"),
+                None => format!("{категория}.{имя}"),
+            };
+            строки.push(if тёзки {
+                json!([вводимый, полное])
+            } else {
+                json!([вводимый])
+            });
+        }
+    }
+    let колонки = if тёзки {
+        json!(["object", "basis"])
+    } else {
+        json!(["object"])
+    };
+    Ok(json!({
+        "columns": колонки,
+        "count": строки.len(),
+        "rows": строки,
+        "note": ПОМЕТКА_ВВОДИМЫХ,
+    }))
+}
+
+/// Метаданные, ссылающиеся на объект или его элемент (`X.Attribute.Y`).
+///
+/// Точное сравнение полного имени. До 27.10.2026 здесь была подстрока
+/// по короткому: `Заказ` цеплял `Document.ЗаказПоставщику` и всё, где
+/// «Заказ» встречается внутри имени.
+fn ссылки_на_объект(
+    conn: &Connection,
+    полные: &[String],
+    limit: i64,
+) -> Result<Value, String> {
+    if !есть_таблица(conn, "metadata_references") {
+        return Ok(нет_таблицы("metadata_references"));
+    }
+    let mut st = conn
+        .prepare(
+            "SELECT source_object, source_category, ref_kind, used_in, path, line, ref_object
+             FROM metadata_references
+             WHERE ref_object = ?1 OR substr(ref_object, 1, length(?1) + 1) = ?1 || '.'",
+        )
+        .map_err(|e| e.to_string())?;
+    // Собрать по всем полным именам, потом упорядочить и обрезать: у тёзок
+    // обрезка по ходу отдала бы limit строк первого и ни одной — второго.
+    let mut все: Vec<[Value; 7]> = Vec::new();
+    for полное in полные {
+        let найдено = st
+            .query_map([полное], |r| {
+                Ok([0, 1, 2, 3, 4, 5, 6].map(|i| значение(r, i)))
+            })
+            .map_err(|e| e.to_string())?;
+        for запись in найдено {
+            все.push(запись.map_err(|e| e.to_string())?);
+        }
+    }
+    let ключ =
+        |ряд: &[Value; 7]| [1, 0, 2, 3].map(|i| ряд[i].as_str().unwrap_or_default().to_string());
+    все.sort_by_key(ключ);
+    let предел = limit.max(0) as usize;
+    let обрезано = все.len() > предел;
+    все.truncate(предел);
+    let строки: Vec<Value> = все.into_iter().map(|ряд| json!(ряд)).collect();
+    let mut v = json!({
+        "columns": ["source_object", "source_category", "ref_kind", "used_in", "path", "line", "ref_object"],
+        "count": строки.len(),
+        "rows": строки,
+    });
+    if обрезано {
+        v["truncated"] = json!(true);
+        v["note"] = json!("достигнут limit");
+    }
+    Ok(v)
+}
+
 /// Права на объект и его элементы; `element` — что именно (у веб-сервиса — операция).
 fn права_объекта(conn: &Connection, полные: &[String]) -> Result<Value, String> {
     let mut st = conn
@@ -1367,6 +1501,8 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                 "predefined",
                 "enum_values",
                 "movements",
+                "based_on",
+                "basis_for",
                 "rights",
                 "options",
                 "subscriptions",
@@ -1466,6 +1602,34 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&name],
         )?;
     }
+    let есть_ссылки = есть_таблица(conn, "metadata_references");
+    if есть("based_on") && !есть_ссылки {
+        out["based_on"] = нет_таблицы("metadata_references");
+    } else if есть("based_on") {
+        // Свойство «Ввод на основании» самого объекта. До 27.10.2026 карточка
+        // его не показывала, хотя сборщик писал его в `metadata_references`
+        // с первой версии: два продукта на бенчмарке постановок заявили, что
+        // таких связей в индексе нет, и собрали цепочку документов по косвенным
+        // признакам. Нашёл их только тот, кто полез в таблицу через sql.
+        out["based_on"] = выборка(
+            conn,
+            &format!(
+                "SELECT ref_object AS basis{кол_источника}
+                 FROM metadata_references
+                 WHERE ref_kind = 'based_on' AND source_object = ?1 COLLATE NOCASE
+                   AND (?2 IS NULL OR source_category = ?2)
+                 ORDER BY {порядок_источника}ref_object",
+                кол_источника = if тёзки {
+                    ", source_category AS category"
+                } else {
+                    ""
+                },
+                порядок_источника = if тёзки { "source_category, " } else { "" },
+            ),
+            &[&name, &кат],
+        )?;
+        out["based_on"]["note"] = json!(ПОМЕТКА_ОСНОВАНИЯ);
+    }
     if есть("forms") {
         // До 27.10.2026 формы не сужались и заданной категорией.
         out["forms"] = выборка(
@@ -1509,6 +1673,8 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         let признаки: Vec<&str> = [
             ("attributes", "attributes.category"),
             ("predefined", "predefined.category"),
+            ("based_on", "based_on.category"),
+            ("basis_for", "basis_for.basis"),
             ("forms", "forms.category"),
             ("rights", "rights.element"),
             ("options", "options.elements"),
@@ -1538,7 +1704,14 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
     // (и цепляли `Document.XПрисоединенныеФайлы`, `Document.ЗаказX`).
     // Теперь полное имя строится одной функцией и сверяется точно.
     let виды: Vec<&'static str> = категории.iter().filter_map(|к| вид_объекта(к)).collect();
-    let полные: Vec<String> = виды.iter().map(|в| format!("{в}.{name}")).collect();
+    let полные = полные_имена(категории.iter().copied(), &name);
+    if есть("basis_for") {
+        out["basis_for"] = if есть_ссылки {
+            вводимые_на_основании(conn, &полные, тёзки)?
+        } else {
+            нет_таблицы("metadata_references")
+        };
+    }
     if есть("rights") {
         out["rights"] = права_объекта(conn, &полные)?;
     }
@@ -1835,13 +2008,18 @@ fn impact(conn: &Connection, args: &Value) -> Result<Value, String> {
         conn,
         &json!({"name": symbol, "parts": ["forms", "rights", "options", "subscriptions", "scheduled_jobs"]}),
     )?;
-    let dependents = выборка(
-        conn,
-        "SELECT source_object, source_category, ref_kind, used_in, path, line
-         FROM metadata_references WHERE ref_object LIKE '%' || ?1 || '%' COLLATE NOCASE
-         ORDER BY source_category, source_object LIMIT ?2",
-        &[&symbol, &limit],
-    )?;
+    // Полные имена — по найденным категориям карточки; объекта нет — ссылаться
+    // не на что, и пустой раздел здесь честный: «не найдено» сказано в card.
+    let полные = полные_имена(
+        card["categories"]
+            .as_array()
+            .filter(|_| card["found"] == true)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+        card["object"].as_str().unwrap_or(&symbol),
+    );
+    let dependents = ссылки_на_объект(conn, &полные, limit)?;
     Ok(json!({
         "symbol": symbol, "kind": "object", "card": card,
         "metadata_dependents": dependents,
@@ -2137,7 +2315,26 @@ fn схема(conn: &Connection, args: &Value) -> Result<Value, String> {
                 |r| r.get(0),
             )
             .unwrap_or(-1);
-        return Ok(json!({"table": t, "columns": cols, "rows": строк}));
+        let mut out = json!({"table": t, "columns": cols, "rows": строк});
+        // Колонка-перечисление: без списка значений модель пишет запрос по
+        // догадке о них. Список — из самой таблицы, а не из документации:
+        // число, записанное дважды, расходится молча.
+        if t.eq_ignore_ascii_case("metadata_references")
+            && есть_таблица(conn, "metadata_references")
+        {
+            out["ref_kinds"] = выборка(
+                conn,
+                "SELECT ref_kind, count(*) AS rows FROM metadata_references
+                 GROUP BY ref_kind ORDER BY ref_kind",
+                &[],
+            )?;
+            out["ref_kinds"]["note"] = json!(
+                "строка читается «source_object ссылается на ref_object видом ref_kind»; \
+                 ref_object — полное имя (Document.X). based_on: source вводится на \
+                 основании ref (то же отдаёт object, разделы based_on/basis_for)"
+            );
+        }
+        return Ok(out);
     }
     // Список таблиц с назначением: назначение берётся из описи схемы, а не
     // выдумывается по имени.
@@ -3025,6 +3222,8 @@ mod tests {
         c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META).unwrap();
         c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META2).unwrap();
         c.execute_batch(gyrfalcon_index::ddl::SCHEMA_REFS).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_INTEGRATION)
+            .unwrap();
         c.execute_batch(
             "INSERT INTO modules(id, rel_path, category, object_name, is_form) VALUES
                (1, 'Documents/Заказ/ObjectModule.bsl', 'Documents', 'Заказ', 0),
@@ -3043,13 +3242,37 @@ mod tests {
              INSERT INTO scheduled_jobs(name, method_name, handler_module, handler_procedure, file) VALUES
                ('НочнойЗаказ', 'Провести', 'Заказ', 'Провести', 'ScheduledJobs/Заказ.xml');
              INSERT INTO metadata_references(source_object, source_category, ref_object, ref_kind, used_in, path) VALUES
-               ('Продажа', 'Documents', 'Заказ', 'attribute_type', 'Document.Продажа.Заказ', 'Documents/Продажа.xml');",
+               ('Продажа', 'Documents', 'Document.Заказ', 'attribute_type', 'Document.Продажа.Attribute.Заказ.Type', 'Documents/Продажа.xml'),
+               ('Продажа', 'Documents', 'Document.ЗаказПоставщику', 'attribute_type', 'Document.Продажа.Attribute.Поставка.Type', 'Documents/Продажа.xml'),
+               ('ИспользоватьЗаказы', 'FunctionalOptions', 'Document.Заказ.Attribute.Сумма', 'functional_option_content', 'FunctionalOption.ИспользоватьЗаказы.Content', 'FunctionalOptions/Заказы.xml'),
+               ('Продажа', 'Documents', 'Document.Заказ', 'based_on', 'Document.Продажа.BasedOn', 'Documents/Продажа.xml'),
+               ('Заказ', 'Documents', 'Catalog.Партнеры', 'based_on', 'Document.Заказ.BasedOn', 'Documents/Заказ.xml');",
         ).unwrap();
 
         let card = object(&c, &json!({"name": "Заказ", "parts": ["forms", "rights", "options", "subscriptions", "scheduled_jobs"]})).unwrap();
         assert_eq!(card["forms"]["rows"].as_array().unwrap().len(), 1);
         assert_eq!(card["rights"]["rows"].as_array().unwrap().len(), 1);
         assert_eq!(card["subscriptions"]["rows"].as_array().unwrap().len(), 1);
+
+        // Ввод на основании — в карточке по умолчанию и в обе стороны.
+        let card = object(&c, &json!({"name": "Заказ"})).unwrap();
+        assert_eq!(
+            card["based_on"]["rows"],
+            json!([["Catalog.Партнеры"]]),
+            "{card:#}"
+        );
+        assert_eq!(
+            card["basis_for"]["rows"],
+            json!([["Document.Продажа"]]),
+            "{card:#}"
+        );
+        let card = object(
+            &c,
+            &json!({"name": "Продажа", "parts": ["based_on", "basis_for"]}),
+        );
+        // У `Продажа` нет модуля в фикстуре — её нет и в реестре: «не найдено»,
+        // а не пустые разделы.
+        assert_eq!(card.unwrap()["found"], false);
 
         let method = impact(&c, &json!({"symbol": "Провести", "kind": "method"})).unwrap();
         assert_eq!(
@@ -3061,13 +3284,152 @@ mod tests {
         );
         assert_eq!(method["risk"], json!("medium"));
         let object = impact(&c, &json!({"symbol": "Заказ", "kind": "object"})).unwrap();
+        // Три ссылки на сам объект и его реквизит; `Document.ЗаказПоставщику`
+        // (подстрока!) и собственный BasedOn заказа — не зависимые.
+        let зависимые: Vec<(String, String)> = object["metadata_dependents"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r[2].as_str().unwrap().into(), r[6].as_str().unwrap().into()))
+            .collect();
         assert_eq!(
-            object["metadata_dependents"]["rows"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
+            зависимые,
+            [
+                ("attribute_type".to_string(), "Document.Заказ".to_string()),
+                ("based_on".to_string(), "Document.Заказ".to_string()),
+                (
+                    "functional_option_content".to_string(),
+                    "Document.Заказ.Attribute.Сумма".to_string()
+                ),
+            ],
+            "{object:#}"
         );
+
+        // Объекта нет — и зависимых нет, а не всё, где встречается подстрока.
+        let нет = impact(&c, &json!({"symbol": "Зак", "kind": "object"})).unwrap();
+        assert_eq!(нет["card"]["found"], false, "{нет:#}");
+        assert_eq!(нет["metadata_dependents"]["count"], 0, "{нет:#}");
+    }
+
+    /// Тёзки: строки ввода на основании помечены, чьи они; пустое — в empty_parts.
+    #[test]
+    fn object_ввод_на_основании_у_тёзок_и_пустой() {
+        let c = индекс_объектов();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_REFS).unwrap();
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES
+               ('Счет','Catalogs','','Catalogs/С.xml'),
+               ('Счет','Documents','','Documents/С.xml');
+             INSERT INTO metadata_references(source_object, source_category, ref_object, ref_kind, used_in, path) VALUES
+               ('Счет', 'Documents', 'Document.РеализацияТоваровУслуг', 'based_on', 'Document.Счет.BasedOn', 'Documents/С.xml'),
+               ('Счет', 'Documents', 'Catalog.Контрагенты', 'attribute_type', 'Document.Счет.Attribute.Контрагент.Type', 'Documents/С.xml'),
+               ('РеализацияТоваровУслуг', 'Documents', 'Document.Счет', 'based_on', 'Document.РеализацияТоваровУслуг.BasedOn', 'Documents/Р.xml'),
+               ('РеализацияТоваровУслуг', 'Documents', 'Catalog.Счет', 'owner', 'Document.РеализацияТоваровУслуг.Owners', 'Documents/Р.xml');",
+        )
+        .unwrap();
+
+        let v = object(
+            &c,
+            &json!({"name": "Счет", "parts": ["based_on", "basis_for"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            v["based_on"]["rows"],
+            json!([["Document.РеализацияТоваровУслуг", "Documents"]]),
+            "{v:#}"
+        );
+        assert_eq!(
+            v["basis_for"]["rows"],
+            json!([["Document.РеализацияТоваровУслуг", "Document.Счет"]]),
+            "ссылка owner на Catalog.Счет — не ввод на основании: {v:#}"
+        );
+        assert!(
+            v["note"].as_str().unwrap().contains("basis_for.basis"),
+            "{v:#}"
+        );
+
+        let v = object(
+            &c,
+            &json!({"name": "Счет", "category": "Catalogs", "parts": ["based_on", "basis_for"]}),
+        )
+        .unwrap();
+        assert_eq!(v["empty_parts"], json!(["based_on", "basis_for"]), "{v:#}");
+    }
+
+    /// Индекс без `metadata_references`: карточка цела, разделы связей помечены
+    /// недоступными (не «пусто»), `schema` и `impact` не падают.
+    #[test]
+    fn без_таблицы_связей_карточка_не_падает() {
+        let c = индекс_объектов();
+        assert!(
+            !есть_таблица(&c, "metadata_references"),
+            "фикстура изменилась"
+        );
+        let v = object(&c, &json!({"name": "РеализацияТоваровУслуг"})).unwrap();
+        assert_eq!(v["attributes"]["count"], 1, "{v:#}");
+        assert_eq!(v["based_on"]["unavailable"], true, "{v:#}");
+        assert_eq!(v["basis_for"]["unavailable"], true, "{v:#}");
+        let пустые = v["empty_parts"].as_array().cloned().unwrap_or_default();
+        assert!(!пустые.contains(&json!("based_on")), "{v:#}");
+        assert!(!пустые.contains(&json!("basis_for")), "{v:#}");
+
+        let s = схема(&c, &json!({"table": "metadata_references"})).unwrap();
+        assert_eq!(s["rows"], -1, "{s:#}");
+        let i = impact(
+            &c,
+            &json!({"symbol": "РеализацияТоваровУслуг", "kind": "object"}),
+        )
+        .unwrap();
+        assert_eq!(i["metadata_dependents"]["unavailable"], true, "{i:#}");
+    }
+
+    /// `impact` у тёзок: строки упорядочены по всем, а limit не съедает второго целиком.
+    #[test]
+    fn impact_тёзки_общий_порядок() {
+        let c = индекс_объектов();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_REFS).unwrap();
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES
+               ('Счет','Catalogs','','Catalogs/С.xml'),
+               ('Счет','Documents','','Documents/С.xml');
+             INSERT INTO metadata_references(source_object, source_category, ref_object, ref_kind, used_in, path) VALUES
+               ('Я', 'Catalogs', 'Catalog.Счет', 'attribute_type', 'u1', 'p'),
+               ('Ю', 'Catalogs', 'Catalog.Счет', 'attribute_type', 'u2', 'p'),
+               ('А', 'Catalogs', 'Document.Счет', 'attribute_type', 'u3', 'p');",
+        )
+        .unwrap();
+        let v = impact(&c, &json!({"symbol": "Счет", "kind": "object", "limit": 2})).unwrap();
+        let d = &v["metadata_dependents"];
+        let кто: Vec<&str> = d["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_str().unwrap())
+            .collect();
+        assert_eq!(кто, ["А", "Ю"], "{v:#}");
+        assert_eq!(d["truncated"], true, "{v:#}");
+    }
+
+    /// `schema` по таблице связей перечисляет виды связей с числами — из самой таблицы.
+    #[test]
+    fn schema_перечисляет_виды_связей() {
+        let c = индекс_объектов();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_REFS).unwrap();
+        c.execute_batch(
+            "INSERT INTO metadata_references(source_object, source_category, ref_object, ref_kind, used_in, path) VALUES
+               ('А', 'Documents', 'Document.Б', 'based_on', 'Document.А.BasedOn', 'Documents/А.xml'),
+               ('В', 'Documents', 'Document.Б', 'based_on', 'Document.В.BasedOn', 'Documents/В.xml'),
+               ('А', 'Documents', 'Catalog.Г', 'attribute_type', 'Document.А.Attribute.Г.Type', 'Documents/А.xml');",
+        )
+        .unwrap();
+        let v = схема(&c, &json!({"table": "metadata_references"})).unwrap();
+        assert_eq!(
+            v["ref_kinds"]["rows"],
+            json!([["attribute_type", 1], ["based_on", 2]]),
+            "{v:#}"
+        );
+        let v = схема(&c, &json!({"table": "object_synonyms"})).unwrap();
+        assert!(v.get("ref_kinds").is_none(), "{v:#}");
     }
 
     #[test]
