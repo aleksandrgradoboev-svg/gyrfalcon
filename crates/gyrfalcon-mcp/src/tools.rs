@@ -1157,13 +1157,14 @@ fn подписки_объекта(
     виды: &[&str],
 ) -> Result<Value, String> {
     const СУФФИКСЫ: [&str; 4] = ["Object", "RecordSet", "Manager", "ValueManager"];
-    let наш_тип = |тип: &str| {
-        виды.iter().any(|вид| {
+    let вид_типа = |тип: &str| {
+        виды.iter().copied().find(|вид| {
             тип
                 .strip_prefix(вид)
                 .is_some_and(|суф| СУФФИКСЫ.contains(&суф))
         })
     };
+    let наш_тип = |тип: &str| вид_типа(тип).is_some();
     let прямо = |ист: &str| {
         ист
             .split_once('.')
@@ -1181,7 +1182,8 @@ fn подписки_объекта(
             "SELECT name, type_refs_json FROM defined_types WHERE instr(type_refs_json, ?1) > 0",
         )
         .map_err(|e| e.to_string())?;
-    let mut через: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Определяемый тип → какие из полных имён (у тёзок их несколько) в его составе.
+    let mut через: std::collections::HashMap<String, Vec<String>> = Default::default();
     for запись in st
         .query_map([имя], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
@@ -1192,10 +1194,18 @@ fn подписки_объекта(
         let состав: Vec<String> = состав
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        if состав.iter().any(|эл| полные.contains(эл)) {
-            через.insert(format!("DefinedType.{тип}"));
+        let свои: Vec<String> = полные
+            .iter()
+            .filter(|п| состав.contains(п))
+            .cloned()
+            .collect();
+        if !свои.is_empty() {
+            через.insert(format!("DefinedType.{тип}"), свои);
         }
     }
+    // Тёзки разных видов (справочник и документ): строка обязана сказать,
+    // ЧЬЯ это подписка, — `via: null` у прямого попадания этого не говорит.
+    let тёзки = виды.len() > 1;
 
     let mut st = conn
         .prepare(
@@ -1228,7 +1238,7 @@ fn подписки_объекта(
         // Прямое имя важнее определяемого типа, тот — подписки на весь вид.
         let via = if источники.iter().any(|ист| прямо(ист)) {
             Some(Value::Null)
-        } else if let Some(ист) = источники.iter().find(|ист| через.contains(*ист))
+        } else if let Some(ист) = источники.iter().find(|ист| через.contains_key(*ист))
         {
             Some(json!(ист))
         } else {
@@ -1240,16 +1250,51 @@ fn подписки_объекта(
         if let Some(via) = via {
             let mut строка = поля.to_vec();
             строка.push(via);
+            if тёзки {
+                let mut чьи = std::collections::BTreeSet::new();
+                for ист in &источники {
+                    match ист.split_once('.') {
+                        Some((тип, хвост)) if хвост == имя => {
+                            if let Some(вид) = вид_типа(тип) {
+                                чьи.insert(format!("{вид}.{имя}"));
+                            }
+                        }
+                        Some(_) => {
+                            if let Some(свои) = через.get(ист) {
+                                чьи.extend(свои.iter().cloned());
+                            }
+                        }
+                        None => {
+                            if let Some(вид) = вид_типа(ист) {
+                                чьи.insert(format!("{вид}.{имя}"));
+                            }
+                        }
+                    }
+                }
+                строка.push(json!(чьи));
+            }
             строки.push(Value::Array(строка));
         }
     }
+    let mut колонки = vec![
+        "name",
+        "event",
+        "handler_module",
+        "handler_procedure",
+        "file",
+        "via",
+    ];
+    if тёзки {
+        колонки.push("objects");
+    }
     Ok(json!({
-        "columns": ["name", "event", "handler_module", "handler_procedure", "file", "via"],
+        "columns": колонки,
         "count": строки.len(),
         "rows": строки,
         "note": "via: пусто — объект назван источником прямо; DefinedType.X — через \
                  определяемый тип; «все объекты вида» — подписка на весь вид. Полный \
-                 список источников подписки — sql по event_subscriptions.source_types",
+                 список источников подписки — sql по event_subscriptions.source_types. \
+                 objects (только у тёзок) — на какие из одноимённых объектов подписка",
     }))
 }
 
@@ -1338,12 +1383,20 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         .as_ref()
         .and(категории.first().map(|к| к.to_string()));
     let mut out = json!({"object": name, "found": true, "categories": категории});
-    if категории.len() > 1 {
-        out["note"] = json!(
-            "имя есть в нескольких категориях — разделы ниже сведены по всем; \
-             уточните category, если нужна одна"
-        );
-    }
+    // Тёзки без `category`: разделы сведены по всем, и принадлежность строки
+    // обязана быть в самой строке. До 27.10.2026 её не было — пометка стояла одна
+    // на ответ, и на `РеестрДокументов` (справочник, 5 реквизитов, и регистр
+    // сведений, 32 поля) два независимых продукта приписали регистру поля
+    // справочника `Дата` и `ВидДокумента` (бенчмарк постановок, 27.10.2026).
+    //
+    // Колонка — последней и только при тёзках: читатели по номеру колонки не
+    // ломаются, а обычная карточка не дорожает на 12 знаков каждой строки.
+    let тёзки = категории.len() > 1;
+    let (кол_категории, порядок_категории) = if тёзки {
+        (", category", "category, ")
+    } else {
+        ("", "")
+    };
 
     if есть("attributes") {
         // Три сжатия, ни одно не теряет данных (замер 29.08.2026:
@@ -1363,15 +1416,17 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         //    пропуск читался как умолчание, а не как потеря.
         out["attributes"] = выборка(
             conn,
-            "SELECT attr_name,
-                    CASE WHEN attr_type LIKE '[%' AND attr_type NOT LIKE '%,%'
-                         THEN trim(replace(replace(attr_type,'[\"',''),'\"]',''))
-                         ELSE attr_type END AS attr_type,
-                    CASE WHEN attr_kind = 'attribute' THEN NULL ELSE attr_kind END AS attr_kind,
-                    ts_name, length, precision, scale
-             FROM object_attributes WHERE object_name = ?1 COLLATE NOCASE
-               AND (?2 IS NULL OR category = ?2)
-             ORDER BY attr_kind, ts_name, attr_name",
+            &format!(
+                "SELECT attr_name,
+                        CASE WHEN attr_type LIKE '[%' AND attr_type NOT LIKE '%,%'
+                             THEN trim(replace(replace(attr_type,'[\"',''),'\"]',''))
+                             ELSE attr_type END AS attr_type,
+                        CASE WHEN attr_kind = 'attribute' THEN NULL ELSE attr_kind END AS attr_kind,
+                        ts_name, length, precision, scale{кол_категории}
+                 FROM object_attributes WHERE object_name = ?1 COLLATE NOCASE
+                   AND (?2 IS NULL OR category = ?2)
+                 ORDER BY {порядок_категории}attr_kind, ts_name, attr_name"
+            ),
             &[&name, &кат],
         )?;
         out["attributes"]["note"] =
@@ -1388,8 +1443,11 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
     if есть("predefined") {
         out["predefined"] = выборка(
             conn,
-            "SELECT item_name, item_code, is_folder FROM predefined_items
-             WHERE object_name = ?1 COLLATE NOCASE AND (?2 IS NULL OR category = ?2)",
+            &format!(
+                "SELECT item_name, item_code, is_folder{кол_категории} FROM predefined_items
+                 WHERE object_name = ?1 COLLATE NOCASE AND (?2 IS NULL OR category = ?2)
+                 ORDER BY {порядок_категории}item_name"
+            ),
             &[&name, &кат],
         )?;
     }
@@ -1409,12 +1467,69 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         )?;
     }
     if есть("forms") {
+        // До 27.10.2026 формы не сужались и заданной категорией.
         out["forms"] = выборка(
             conn,
-            "SELECT DISTINCT form_name FROM modules
-             WHERE object_name = ?1 COLLATE NOCASE AND is_form = 1",
-            &[&name],
+            &format!(
+                "SELECT DISTINCT form_name{кол_категории} FROM modules
+                 WHERE object_name = ?1 COLLATE NOCASE AND is_form = 1
+                   AND (?2 IS NULL OR category = ?2)
+                 ORDER BY {порядок_категории}form_name"
+            ),
+            &[&name, &кат],
         )?;
+    }
+    if тёзки {
+        // Пометка с числами по категориям — чтобы «сведены по всем» читалось
+        // как «37 = 5 + 32», а не как «у объекта 37 реквизитов».
+        let mut по_разделам = Vec::new();
+        for раздел in ["attributes", "predefined", "forms"] {
+            let Some(строки) = out.get(раздел).and_then(|v| v["rows"].as_array())
+            else {
+                continue;
+            };
+            // Колонка `category` — последняя, она добавлена выше в каждый из этих разделов.
+            let Some(столбец) = out[раздел]["columns"]
+                .as_array()
+                .and_then(|к| к.len().checked_sub(1))
+            else {
+                continue;
+            };
+            if строки.is_empty() {
+                continue;
+            }
+            let mut счёт: std::collections::BTreeMap<&str, usize> = Default::default();
+            for ряд in строки {
+                *счёт.entry(ряд[столбец].as_str().unwrap_or("")).or_default() += 1;
+            }
+            let счёт: Vec<String> = счёт.iter().map(|(к, n)| format!("{к} {n}")).collect();
+            по_разделам.push(format!("{раздел}: {}", счёт.join(", ")));
+        }
+        // Где у каждого запрошенного раздела признак принадлежности строки.
+        let признаки: Vec<&str> = [
+            ("attributes", "attributes.category"),
+            ("predefined", "predefined.category"),
+            ("forms", "forms.category"),
+            ("rights", "rights.element"),
+            ("options", "options.elements"),
+            ("subscriptions", "subscriptions.objects"),
+        ]
+        .into_iter()
+        .filter(|(раздел, _)| есть(раздел))
+        .map(|(_, признак)| признак)
+        .collect();
+        out["note"] = json!(format!(
+            "имя есть в нескольких категориях ({}) — это РАЗНЫЕ объекты. Разделы \
+             сведены по всем; чья строка — в колонке {}{}. Уточните category, если \
+             нужен один объект",
+            категории.join(", "),
+            признаки.join(", "),
+            if по_разделам.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", по_разделам.join("; "))
+            }
+        ));
     }
     // Права, опции и подписки записывают объект ПОЛНЫМ именем (`Document.X`),
     // реквизиты и движения — коротким. До 0.1.19 все разделы искали по
@@ -2287,6 +2402,126 @@ mod tests {
         .unwrap();
         assert_eq!(v["found"], false, "{v:#}");
         assert_eq!(v["categories"], json!(["CommonForms", "CommonModules"]));
+    }
+
+    /// Тёзки без `category`: у каждой строки своя категория, а пометка — с числами.
+    ///
+    /// Эталон — `РеестрДокументов` из живой конфигурации ERP (27.10.2026): справочник
+    /// с 5 реквизитами и регистр сведений с 32 полями. Без колонки два продукта
+    /// приписали регистру поля справочника `Дата` и `ВидДокумента`.
+    #[test]
+    fn object_тёзки_строки_помечены_категорией() {
+        let c = индекс_объектов();
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES
+               ('РеестрДокументов','Catalogs','','Catalogs/Р.xml'),
+               ('РеестрДокументов','InformationRegisters','','InformationRegisters/Р.xml');
+             INSERT INTO object_attributes (object_name, category, attr_name, attr_type, attr_kind, source_file)
+               VALUES ('РеестрДокументов','Catalogs','ВидДокумента','String','attribute','Catalogs/Р.xml'),
+                      ('РеестрДокументов','Catalogs','Дата','Date','attribute','Catalogs/Р.xml'),
+                      ('РеестрДокументов','Catalogs','Договор','String','attribute','Catalogs/Р.xml'),
+                      ('РеестрДокументов','Catalogs','Комментарий','String','attribute','Catalogs/Р.xml'),
+                      ('РеестрДокументов','Catalogs','УникальныйИдентитификатор','String','attribute','Catalogs/Р.xml');
+             WITH RECURSIVE н(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM н WHERE i < 32)
+             INSERT INTO object_attributes (object_name, category, attr_name, attr_type, attr_kind, source_file)
+               SELECT 'РеестрДокументов','InformationRegisters','Поле' || i,'String','dimension',
+                      'InformationRegisters/Р.xml' FROM н;
+             INSERT INTO modules (rel_path, category, object_name, module_type, form_name, is_form)
+               VALUES ('Catalogs/РеестрДокументов/Forms/ФормаЭлемента/Ext/Form/Module.bsl',
+                       'Catalogs','РеестрДокументов','Module','ФормаЭлемента',1);
+             INSERT INTO predefined_items (object_name, category, item_name, source_file)
+               VALUES ('РеестрДокументов','Catalogs','Основной','Catalogs/Р.xml');
+             INSERT INTO event_subscriptions (name, event, handler_module, handler_procedure, source_types, file) VALUES
+               ('ПередЗаписьюРеестра', 'BeforeWrite', 'М', 'П',
+                '[\"InformationRegisterRecordSet.РеестрДокументов\"]', 'ES/1.xml');",
+        )
+        .unwrap();
+
+        let v = object(
+            &c,
+            &json!({"name": "РеестрДокументов",
+                    "parts": ["attributes", "predefined", "forms", "subscriptions"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            v["predefined"]["rows"],
+            json!([["Основной", null, 0, "Catalogs"]]),
+            "{v:#}"
+        );
+        let подписки = &v["subscriptions"];
+        assert_eq!(
+            подписки["columns"].as_array().unwrap().last(),
+            Some(&json!("objects")),
+            "{v:#}"
+        );
+        assert_eq!(
+            подписки["rows"][0][6],
+            json!(["InformationRegister.РеестрДокументов"]),
+            "подписка регистра, а не справочника: {v:#}"
+        );
+        let attrs = &v["attributes"];
+        assert_eq!(attrs["count"], 37, "{v:#}");
+        let колонки = attrs["columns"].as_array().unwrap();
+        assert_eq!(колонки.last(), Some(&json!("category")), "{v:#}");
+        let чей = |реквизит: &str| {
+            attrs["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r[0] == реквизит)
+                .map(|r| r[колонки.len() - 1].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(чей("Дата"), [json!("Catalogs")], "{v:#}");
+        assert_eq!(чей("ВидДокумента"), [json!("Catalogs")], "{v:#}");
+        assert_eq!(чей("Поле1"), [json!("InformationRegisters")], "{v:#}");
+        assert_eq!(
+            v["forms"]["rows"],
+            json!([["ФормаЭлемента", "Catalogs"]]),
+            "{v:#}"
+        );
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.contains("attributes: Catalogs 5, InformationRegisters 32"),
+            "{note}"
+        );
+        assert!(note.contains("subscriptions.objects"), "{note}");
+        assert!(!note.contains("rights"), "rights не запрошены: {note}");
+
+        // С категорией — один объект и прежняя форма ответа, без колонки.
+        let v = object(
+            &c,
+            &json!({"name": "РеестрДокументов", "category": "InformationRegisters",
+                    "parts": ["attributes", "forms"]}),
+        )
+        .unwrap();
+        assert_eq!(v["attributes"]["count"], 32, "{v:#}");
+        assert!(
+            !v["attributes"]["columns"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("category")),
+            "{v:#}"
+        );
+        assert_eq!(
+            v["forms"]["count"], 0,
+            "форма справочника не регистра: {v:#}"
+        );
+        assert!(v.get("note").is_none(), "{v:#}");
+
+        // Объект без тёзок — колонки нет, ответ прежний.
+        let v = object(
+            &c,
+            &json!({"name": "РеализацияТоваровУслуг", "parts": ["attributes"]}),
+        )
+        .unwrap();
+        assert!(
+            !v["attributes"]["columns"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("category")),
+            "{v:#}"
+        );
     }
 
     /// Права, опции, подписки и задания — по полному имени и точно (п. 4).

@@ -127,7 +127,7 @@ pub fn assist_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
 
     let mut object_rows = Vec::new();
     for o in objects.iter().filter(|_| !platform_target) {
-        let attrs = attributes(conn, &o.name)?;
+        let attrs = attributes(conn, &o.name, &o.category)?;
         object_rows.push(json!({
             "name": o.name,
             "category": o.category,
@@ -337,7 +337,9 @@ fn object_candidates(
         {
             continue;
         }
-        let key = o.name.to_lowercase();
+        // Ключ — имя И категория: тёзки (справочник и регистр) — разные
+        // объекты, и выдача по имени оставляла только одного из них.
+        let key = format!("{}\u{0}{}", o.name.to_lowercase(), o.category);
         match by_name.get(&key) {
             Some(old) if old.score >= o.score => {}
             _ => {
@@ -350,6 +352,7 @@ fn object_candidates(
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.category.cmp(&b.category))
     });
     out.truncate(limit.min(5));
     Ok(out)
@@ -383,17 +386,20 @@ fn fts_ids(
     Ok(out)
 }
 
-fn attributes(conn: &Connection, object: &str) -> Result<Value, String> {
+/// Реквизиты объекта ЭТОЙ категории. Справочник и регистр сведений бывают
+/// тёзками; без категории строка справочника несла поля регистра под своей
+/// же пометкой `category` (`РеестрДокументов` в живой конфигурации, 27.10.2026).
+fn attributes(conn: &Connection, object: &str, category: &str) -> Result<Value, String> {
     let mut st = conn
         .prepare(
             "SELECT attr_name, attr_type, attr_kind, COALESCE(ts_name,'')
              FROM object_attributes
-             WHERE object_name = ?1 COLLATE NOCASE
-             ORDER BY attr_kind, ts_name, attr_name LIMIT ?2",
+             WHERE object_name = ?1 COLLATE NOCASE AND category = ?2
+             ORDER BY attr_kind, ts_name, attr_name LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
     let rows = st
-        .query_map(rusqlite::params![object, ATTR_LIMIT], |r| {
+        .query_map(rusqlite::params![object, category, ATTR_LIMIT], |r| {
             Ok(json!({
                 "name": r.get::<_, String>(0)?,
                 "type": r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -741,7 +747,7 @@ mod tests {
                 id INTEGER PRIMARY KEY, object_name TEXT, category TEXT, synonym TEXT
              );
              CREATE TABLE object_attributes(
-                id INTEGER PRIMARY KEY, object_name TEXT, attr_name TEXT,
+                id INTEGER PRIMARY KEY, object_name TEXT, category TEXT, attr_name TEXT,
                 attr_type TEXT, attr_kind TEXT, ts_name TEXT
              );
              CREATE VIRTUAL TABLE methods_fts USING fts5(name, tokenize='trigram');
@@ -762,7 +768,7 @@ mod tests {
              INSERT INTO objects_fts(rowid,name)
                 SELECT id,object_name || ' ' || synonym FROM object_synonyms;
              INSERT INTO object_attributes VALUES
-                (1, 'ЗаказКлиента', 'Контрагент', 'CatalogRef.Контрагенты', 'attribute', '');",
+                (1, 'ЗаказКлиента', 'Documents', 'Контрагент', 'CatalogRef.Контрагенты', 'attribute', '');",
         )
         .unwrap();
         c
@@ -784,6 +790,44 @@ mod tests {
         assert_eq!(v["objects"][0]["name"], json!("ЗаказКлиента"));
         assert_eq!(v["objects"][0]["attributes"]["shown"], json!(1));
         assert!(v.get("semantic_warning").is_some());
+    }
+
+    /// Тёзки — два объекта, у каждого свои реквизиты (`РеестрДокументов`, 27.10.2026).
+    #[test]
+    fn тёзки_не_делят_реквизиты() {
+        let c = index();
+        c.execute_batch(
+            "INSERT INTO object_synonyms VALUES (2, 'ЗаказКлиента', 'InformationRegisters', 'Заказ клиента');
+             INSERT INTO objects_fts(rowid,name) VALUES (2, 'ЗаказКлиента Заказ клиента');
+             INSERT INTO object_attributes VALUES
+                (2, 'ЗаказКлиента', 'InformationRegisters', 'Период', 'Date', 'dimension', '');",
+        )
+        .unwrap();
+        let v = assist_bsl(
+            &c,
+            &json!({"task": "заказ клиента", "limit": 5, "platform_help": false}),
+        )
+        .unwrap();
+        let объекты: Vec<(Value, Value)> = v["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["name"] == "ЗаказКлиента")
+            .map(|o| {
+                (
+                    o["category"].clone(),
+                    o["attributes"]["rows"][0]["name"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            объекты,
+            [
+                (json!("Documents"), json!("Контрагент")),
+                (json!("InformationRegisters"), json!("Период"))
+            ],
+            "{v:#}"
+        );
     }
 
     #[test]
