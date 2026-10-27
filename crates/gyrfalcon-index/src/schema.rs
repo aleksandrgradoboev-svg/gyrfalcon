@@ -125,7 +125,9 @@ pub const TABLES: &[Table] = &[
     // --- связи и поведение ---
     Table {
         name: "metadata_references",
-        purpose: "ссылки между объектами метаданных",
+        purpose: "ссылки между объектами метаданных; вид связи — ref_kind (в т.ч. based_on — \
+                  ввод на основании, owner — владелец), перечень с числами — \
+                  schema(table='metadata_references')",
         reference_rows: 88_186,
         implemented: true,
     },
