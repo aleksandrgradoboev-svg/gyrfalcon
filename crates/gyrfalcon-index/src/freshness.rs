@@ -82,6 +82,17 @@ pub struct Freshness {
     /// нельзя показывать как «свежий» — молчание тогда значило бы два
     /// разных состояния сразу.
     pub unchecked: Option<String>,
+    /// Расширения, которые лежат на диске рядом с `src`, но которых нет в
+    /// реестре `extensions` индекса: `Имя (../cfe)`.
+    ///
+    /// По времени правки этого не поймать. Индекс, собранный кодом, который
+    /// раскладки не понимал (одно расширение в `cfe/` до 0.1.19), при
+    /// нетронутых файлах выглядит свежим вечно — и отвечает «0 перехватов»
+    /// уверенно. Инкремент его тоже не догонит: раскладку он берёт из того же
+    /// реестра. Нужна полная пересборка, и отметка говорит именно это.
+    pub missing_extensions: Vec<String>,
+    /// Обратное: `rel_root` из реестра индекса, которых на диске больше нет.
+    pub vanished_extensions: Vec<String>,
 }
 
 impl Freshness {
@@ -120,6 +131,20 @@ impl Freshness {
                 "коммит рабочей копии {} против {} при сборке",
                 кратко(&self.current_commit),
                 кратко(&self.built_commit)
+            ));
+        }
+        if !self.missing_extensions.is_empty() {
+            части.push(format!(
+                "на диске есть расширения, которых нет в индексе: {} — их код, объекты \
+                 и перехваты в ответах отсутствуют, инкремент этого не догонит",
+                self.missing_extensions.join(", ")
+            ));
+        }
+        if !self.vanished_extensions.is_empty() {
+            части.push(format!(
+                "расширения из индекса исчезли с диска: {} — их перехваты и объекты \
+                 в ответах устарели",
+                self.vanished_extensions.join(", ")
             ));
         }
         Some(format!(
@@ -170,7 +195,15 @@ fn длительность(secs: u64) -> String {
 /// откуда и когда он собран. Аргументами их не передаём: тогда вызывающий
 /// мог бы сверить индекс не с тем каталогом и получить складный неверный
 /// ответ.
-pub fn check(built_at: u64, source: &str, built_commit: &str) -> Freshness {
+///
+/// `known_extension_roots` — `rel_root` из реестра `extensions` того же
+/// индекса (`IndexInfo::extension_roots`): с ними сверяются расширения на диске.
+pub fn check(
+    built_at: u64,
+    source: &str,
+    built_commit: &str,
+    known_extension_roots: &[String],
+) -> Freshness {
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -205,8 +238,52 @@ pub fn check(built_at: u64, source: &str, built_commit: &str) -> Freshness {
         && !f.current_commit.is_empty()
         && f.built_commit != f.current_commit;
 
-    f.stale = changed > 0 || коммит_разошёлся;
+    f.missing_extensions = расширения_вне_индекса(&root, known_extension_roots);
+    f.vanished_extensions = расширения_вне_диска(&root, known_extension_roots);
+
+    f.stale = changed > 0
+        || коммит_разошёлся
+        || !f.missing_extensions.is_empty()
+        || !f.vanished_extensions.is_empty();
     f
+}
+
+/// Корни из реестра индекса, которых на диске больше нет как выгрузки
+/// расширения: удалённое расширение не меняет mtime ни одного оставшегося
+/// файла, и без этой сверки индекс отдавал бы его перехваты как живые.
+pub fn расширения_вне_диска(
+    root: &Path,
+    known_extension_roots: &[String],
+) -> Vec<String> {
+    let на_диске: Vec<String> = crate::extensions::корни(root)
+        .iter()
+        .filter(|к| к.extension.is_some())
+        .map(|к| crate::extensions::rel_from(root, &к.dir))
+        .collect();
+    known_extension_roots
+        .iter()
+        .filter(|k| !на_диске.contains(k))
+        .cloned()
+        .collect()
+}
+
+/// Расширения на диске, чьего корня нет среди известных индексу.
+///
+/// Сверка по `rel_root`, а не по имени: имя одного расширения в `cfe/` берётся
+/// из манифеста, и правка манифеста не должна выглядеть пропажей. Обход —
+/// только каталоги `ext`/`cfe` и манифесты в них, файлов модулей не касается.
+pub fn расширения_вне_индекса(
+    root: &Path,
+    known_extension_roots: &[String],
+) -> Vec<String> {
+    crate::extensions::корни(root)
+        .into_iter()
+        .filter_map(|к| {
+            let e = к.extension?;
+            let rel = crate::extensions::rel_from(root, &к.dir);
+            (!known_extension_roots.contains(&rel)).then(|| format!("{} ({rel})", e.name))
+        })
+        .collect()
 }
 
 /// Обойти дерево и посчитать файлы новее сборки.
@@ -308,7 +385,7 @@ mod tests {
         let файл = "CommonModules/А/Ext/Module.bsl";
         let к = Корпус::новый("свежий", файл);
         // Индекс собран ПОСЛЕ правки файла.
-        let f = check(к.mtime(файл) + 600, &к.путь(), "");
+        let f = check(к.mtime(файл) + 600, &к.путь(), "", &[]);
         assert!(!f.stale, "файл старше сборки — отставания нет");
         assert!(f.note().is_none(), "свежий индекс не платит токенами");
     }
@@ -318,7 +395,7 @@ mod tests {
         let файл = "CommonModules/Б/Ext/Module.bsl";
         let к = Корпус::новый("правка", файл);
         // Индекс собран ДО правки файла.
-        let f = check(к.mtime(файл) - 600, &к.путь(), "");
+        let f = check(к.mtime(файл) - 600, &к.путь(), "", &[]);
         assert!(f.stale);
         assert_eq!(f.changed, 1);
         let note = f.note().unwrap();
@@ -330,7 +407,7 @@ mod tests {
     #[test]
     fn чужое_расширение_отставанием_не_считается() {
         let к = Корпус::новый("чужое", "README.md");
-        let f = check(к.mtime("README.md") - 600, &к.путь(), "");
+        let f = check(к.mtime("README.md") - 600, &к.путь(), "", &[]);
         assert!(!f.stale, "индекс .md не читает — правка его не старит");
     }
 
@@ -338,7 +415,7 @@ mod tests {
     fn xml_метаданных_считается_наравне_с_bsl() {
         let файл = "Catalogs/Номенклатура.xml";
         let к = Корпус::новый("xml", файл);
-        let f = check(к.mtime(файл) - 600, &к.путь(), "");
+        let f = check(к.mtime(файл) - 600, &к.путь(), "", &[]);
         assert!(f.stale, "метаданные меняют индекс так же, как код");
     }
 
@@ -346,7 +423,7 @@ mod tests {
     fn пропавший_каталог_не_выдаётся_за_свежесть() {
         // Ключевое: «не смог проверить» и «свежий» — разные состояния,
         // и молчать во втором случае можно, а в первом нельзя.
-        let f = check(сейчас(), "Z:/нет/такого/каталога", "");
+        let f = check(сейчас(), "Z:/нет/такого/каталога", "", &[]);
         assert!(!f.stale);
         assert!(f.unchecked.is_some());
         let note = f.note().expect("непроверенное обязано говорить о себе");
@@ -355,7 +432,7 @@ mod tests {
 
     #[test]
     fn пустой_источник_тоже_непроверен() {
-        let f = check(сейчас(), "", "");
+        let f = check(сейчас(), "", "", &[]);
         assert!(f.unchecked.is_some());
         assert!(f.note().is_some());
     }
@@ -363,7 +440,7 @@ mod tests {
     #[test]
     fn нулевое_время_сборки_не_выдаётся_за_свежесть() {
         let к = Корпус::новый("нулевое", "CommonModules/Д/Ext/Module.bsl");
-        let f = check(0, &к.путь(), "");
+        let f = check(0, &к.путь(), "", &[]);
         assert!(
             f.unchecked.is_some(),
             "без времени сборки сравнивать не с чем"
@@ -412,7 +489,49 @@ mod tests {
         // это читалось бы как «отстал» немедленно после успешной пересборки.
         let файл = "CommonModules/Г/Ext/Module.bsl";
         let к = Корпус::новый("запас", файл);
-        let f = check(к.mtime(файл), &к.путь(), "");
+        let f = check(к.mtime(файл), &к.путь(), "", &[]);
         assert!(!f.stale, "своя же сборка не должна выглядеть отставанием");
+    }
+
+    /// Расширение в `cfe/`, которого нет в реестре индекса, — отставание, хотя
+    /// ни один файл не новее сборки: так выглядит индекс, собранный кодом,
+    /// не понимавшим этой раскладки. Известное индексу — не отставание.
+    #[test]
+    fn расширение_на_диске_вне_индекса_делает_индекс_отставшим() {
+        let d = std::env::temp_dir().join("gyrfalcon-fresh-ext-missing");
+        let _ = fs::remove_dir_all(&d);
+        let src = d.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("Configuration.xml"), "<MetaDataObject/>").unwrap();
+        fs::create_dir_all(d.join("cfe")).unwrap();
+        fs::write(
+            d.join("cfe/Configuration.xml"),
+            "<MetaDataObject><Configuration><Properties><Name>СвоёРасширение</Name>\
+             </Properties></Configuration></MetaDataObject>",
+        )
+        .unwrap();
+        let путь = src.to_string_lossy().to_string();
+        let после = сейчас() + 600;
+
+        let f = check(после, &путь, "", &[]);
+        assert!(f.stale, "{f:?}");
+        assert_eq!(f.changed, 0, "по времени правки отставания нет: {f:?}");
+        assert_eq!(f.missing_extensions, ["СвоёРасширение (../cfe)"]);
+        let note = f.note().unwrap();
+        assert!(
+            note.contains("СвоёРасширение") && note.contains("инкремент"),
+            "{note}"
+        );
+
+        let f = check(после, &путь, "", &["../cfe".to_string()]);
+        assert!(!f.stale && f.missing_extensions.is_empty(), "{f:?}");
+
+        // Обратное: индекс знает расширение, которого на диске уже нет.
+        fs::remove_dir_all(d.join("cfe")).unwrap();
+        let f = check(после, &путь, "", &["../cfe".to_string()]);
+        assert!(f.stale, "{f:?}");
+        assert_eq!(f.vanished_extensions, ["../cfe"]);
+        assert!(f.note().unwrap().contains("исчезли"), "{f:?}");
+        let _ = fs::remove_dir_all(&d);
     }
 }

@@ -174,8 +174,14 @@ impl FreshnessGuard {
         let путь = корень.clone();
         let built_at = info.built_at;
         let коммит = info.git_commit.clone();
+        let известные = info.extension_roots.clone();
         std::thread::spawn(move || {
-            let f = gyrfalcon_index::freshness::check(built_at, &путь.to_string_lossy(), &коммит);
+            let f = gyrfalcon_index::freshness::check(
+                built_at,
+                &путь.to_string_lossy(),
+                &коммит,
+                &известные,
+            );
             для_обхода.изменено.fetch_add(f.changed, Ordering::AcqRel);
             {
                 let mut п = для_обхода.примеры.lock().unwrap();
@@ -189,6 +195,8 @@ impl FreshnessGuard {
                 let mut b = для_обхода.основа.lock().unwrap();
                 b.current_commit = f.current_commit;
                 b.unchecked = f.unchecked;
+                b.missing_extensions = f.missing_extensions;
+                b.vanished_extensions = f.vanished_extensions;
             }
             для_обхода.готово.store(true, Ordering::Release);
         });
@@ -230,6 +238,8 @@ impl FreshnessGuard {
         let f = Freshness {
             age_secs: возраст,
             stale: изменено > 0
+                || !основа.missing_extensions.is_empty()
+                || !основа.vanished_extensions.is_empty()
                 || (!основа.built_commit.is_empty()
                     && !текущий.is_empty()
                     && основа.built_commit != текущий),
@@ -299,7 +309,10 @@ impl FreshnessGuard {
             "не выполнена"
         } else if !готово {
             "идёт первый обход"
-        } else if изменено > 0 {
+        } else if изменено > 0
+            || !основа.missing_extensions.is_empty()
+            || !основа.vanished_extensions.is_empty()
+        {
             "индекс отстал"
         } else {
             "исходники сверены, расхождений нет"
@@ -323,6 +336,11 @@ impl FreshnessGuard {
                 "ПОДПИСКА НЕ ВСТАЛА: расхождения, возникшие ПОСЛЕ старта сервера,                  замечены не будут. Перезапустите сервер или пересоберите индекс перед выводами"
             },
             "reason": основа.unchecked,
+            // Пусто — не печатается: свежий индекс молчит и здесь.
+            "missing_extensions": (!основа.missing_extensions.is_empty())
+                .then_some(&основа.missing_extensions),
+            "vanished_extensions": (!основа.vanished_extensions.is_empty())
+                .then_some(&основа.vanished_extensions),
         })
     }
 

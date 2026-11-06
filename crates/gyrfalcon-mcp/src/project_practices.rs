@@ -57,7 +57,12 @@ fn require_fresh_index(conn: &Connection, source: &str, commit: &str) -> Result<
     let built_at: u64 = built_at
         .parse()
         .map_err(|_| "некорректный built_at индекса")?;
-    let freshness = gyrfalcon_index::freshness::check(built_at, source, commit);
+    let freshness = gyrfalcon_index::freshness::check(
+        built_at,
+        source,
+        commit,
+        &gyrfalcon_index::build::extension_roots(conn),
+    );
     if let Some(ref reason) = freshness.unchecked {
         return Err(format!("свежесть индекса не проверена: {reason}"));
     }

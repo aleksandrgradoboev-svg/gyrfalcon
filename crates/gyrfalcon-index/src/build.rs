@@ -1704,6 +1704,10 @@ pub struct IndexInfo {
     pub built_at: u64,
     /// Коммит выгрузки на момент сборки. Пусто — не git или не записан.
     pub git_commit: String,
+    /// `rel_root` расширений из реестра `extensions`. Пусто — расширений в
+    /// индексе нет (или реестра нет: индекс собран до схемы 4 и кода
+    /// расширений не содержит вовсе).
+    pub extension_roots: Vec<String>,
 }
 
 impl IndexInfo {
@@ -1714,7 +1718,12 @@ impl IndexInfo {
     /// возможность сверить индекс не с тем каталогом, получив складный
     /// неверный ответ.
     pub fn freshness(&self) -> crate::freshness::Freshness {
-        crate::freshness::check(self.built_at, &self.source_path, &self.git_commit)
+        crate::freshness::check(
+            self.built_at,
+            &self.source_path,
+            &self.git_commit,
+            &self.extension_roots,
+        )
     }
 
     /// Умеет ли текущий код читать этот индекс.
@@ -1748,7 +1757,18 @@ pub fn info(path: &Path) -> Result<IndexInfo> {
         source_path: get("source_path"),
         built_at: get("built_at").parse().unwrap_or(0),
         git_commit: get("git_commit"),
+        extension_roots: extension_roots(&conn),
     })
+}
+
+/// `rel_root` расширений из реестра индекса; нет реестра — пусто.
+pub fn extension_roots(conn: &Connection) -> Vec<String> {
+    let Ok(mut st) = conn.prepare("SELECT rel_root FROM extensions") else {
+        return Vec::new();
+    };
+    st.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(std::result::Result::ok).collect())
+        .unwrap_or_default()
 }
 
 fn split_path(rel: &str) -> (String, String) {
