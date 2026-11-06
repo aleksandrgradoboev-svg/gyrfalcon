@@ -91,6 +91,8 @@ pub struct Freshness {
     /// уверенно. Инкремент его тоже не догонит: раскладку он берёт из того же
     /// реестра. Нужна полная пересборка, и отметка говорит именно это.
     pub missing_extensions: Vec<String>,
+    /// Обратное: `rel_root` из реестра индекса, которых на диске больше нет.
+    pub vanished_extensions: Vec<String>,
 }
 
 impl Freshness {
@@ -136,6 +138,13 @@ impl Freshness {
                 "на диске есть расширения, которых нет в индексе: {} — их код, объекты \
                  и перехваты в ответах отсутствуют, инкремент этого не догонит",
                 self.missing_extensions.join(", ")
+            ));
+        }
+        if !self.vanished_extensions.is_empty() {
+            части.push(format!(
+                "расширения из индекса исчезли с диска: {} — их перехваты и объекты \
+                 в ответах устарели",
+                self.vanished_extensions.join(", ")
             ));
         }
         Some(format!(
@@ -230,9 +239,32 @@ pub fn check(
         && f.built_commit != f.current_commit;
 
     f.missing_extensions = расширения_вне_индекса(&root, known_extension_roots);
+    f.vanished_extensions = расширения_вне_диска(&root, known_extension_roots);
 
-    f.stale = changed > 0 || коммит_разошёлся || !f.missing_extensions.is_empty();
+    f.stale = changed > 0
+        || коммит_разошёлся
+        || !f.missing_extensions.is_empty()
+        || !f.vanished_extensions.is_empty();
     f
+}
+
+/// Корни из реестра индекса, которых на диске больше нет как выгрузки
+/// расширения: удалённое расширение не меняет mtime ни одного оставшегося
+/// файла, и без этой сверки индекс отдавал бы его перехваты как живые.
+pub fn расширения_вне_диска(
+    root: &Path,
+    known_extension_roots: &[String],
+) -> Vec<String> {
+    let на_диске: Vec<String> = crate::extensions::корни(root)
+        .iter()
+        .filter(|к| к.extension.is_some())
+        .map(|к| crate::extensions::rel_from(root, &к.dir))
+        .collect();
+    known_extension_roots
+        .iter()
+        .filter(|k| !на_диске.contains(k))
+        .cloned()
+        .collect()
 }
 
 /// Расширения на диске, чьего корня нет среди известных индексу.
@@ -493,6 +525,13 @@ mod tests {
 
         let f = check(после, &путь, "", &["../cfe".to_string()]);
         assert!(!f.stale && f.missing_extensions.is_empty(), "{f:?}");
+
+        // Обратное: индекс знает расширение, которого на диске уже нет.
+        fs::remove_dir_all(d.join("cfe")).unwrap();
+        let f = check(после, &путь, "", &["../cfe".to_string()]);
+        assert!(f.stale, "{f:?}");
+        assert_eq!(f.vanished_extensions, ["../cfe"]);
+        assert!(f.note().unwrap().contains("исчезли"), "{f:?}");
         let _ = fs::remove_dir_all(&d);
     }
 }

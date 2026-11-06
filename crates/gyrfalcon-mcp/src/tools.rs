@@ -2173,14 +2173,25 @@ fn оглавление_модуля(conn: &Connection, module: &str) -> Result<
              ORDER BY length(mo.rel_path), mo.rel_path",
         )
         .map_err(|e| e.to_string())?;
-    let кандидаты: Vec<(i64, String, i64)> = st
+    let ключ = module.trim_matches('/').to_lowercase();
+    let mut кандидаты: Vec<(i64, String, i64)> = st
         .query_map([format!("%{module}%")], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })
         .map_err(|e| e.to_string())?
         .filter_map(std::result::Result::ok)
         .collect();
-    let ключ = module.trim_matches('/').to_lowercase();
+    if кандидаты.is_empty() {
+        // `LIKE` понижает только ASCII: `общегоназначения` мимо
+        // `ОбщегоНазначения`. Второй заход — подстрока в Rust по всем путям;
+        // он идёт только после промаха, обычный вызов его не оплачивает.
+        кандидаты = st
+            .query_map(["%"], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(std::result::Result::ok)
+            .filter(|(_, п, _): &(i64, String, i64)| п.to_lowercase().contains(&ключ))
+            .collect();
+    }
     let точно: Vec<&(i64, String, i64)> = кандидаты
         .iter()
         .filter(|(_, п, _)| п.to_lowercase() == ключ)
@@ -2755,7 +2766,7 @@ mod tests {
         assert_eq!(v["methods"]["count"], 1, "модуль расширения: {v:#}");
 
         // Имя модуля вместо пути: `СервисКлиент` не мешает, точный сегмент побеждает.
-        let v = read(&c, &json!({"module": "СервисКлиент"})).unwrap();
+        let v = read(&c, &json!({"module": "сервисклиент"})).unwrap();
         assert_eq!(
             v["module"], "CommonModules/СервисКлиент/Ext/Module.bsl",
             "{v:#}"

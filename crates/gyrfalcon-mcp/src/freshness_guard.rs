@@ -196,6 +196,7 @@ impl FreshnessGuard {
                 b.current_commit = f.current_commit;
                 b.unchecked = f.unchecked;
                 b.missing_extensions = f.missing_extensions;
+                b.vanished_extensions = f.vanished_extensions;
             }
             для_обхода.готово.store(true, Ordering::Release);
         });
@@ -238,6 +239,7 @@ impl FreshnessGuard {
             age_secs: возраст,
             stale: изменено > 0
                 || !основа.missing_extensions.is_empty()
+                || !основа.vanished_extensions.is_empty()
                 || (!основа.built_commit.is_empty()
                     && !текущий.is_empty()
                     && основа.built_commit != текущий),
@@ -307,7 +309,10 @@ impl FreshnessGuard {
             "не выполнена"
         } else if !готово {
             "идёт первый обход"
-        } else if изменено > 0 || !основа.missing_extensions.is_empty() {
+        } else if изменено > 0
+            || !основа.missing_extensions.is_empty()
+            || !основа.vanished_extensions.is_empty()
+        {
             "индекс отстал"
         } else {
             "исходники сверены, расхождений нет"
@@ -334,6 +339,8 @@ impl FreshnessGuard {
             // Пусто — не печатается: свежий индекс молчит и здесь.
             "missing_extensions": (!основа.missing_extensions.is_empty())
                 .then_some(&основа.missing_extensions),
+            "vanished_extensions": (!основа.vanished_extensions.is_empty())
+                .then_some(&основа.vanished_extensions),
         })
     }
 

@@ -742,6 +742,13 @@ fn cmd_update(args: &[String]) -> Result<(), String> {
                 f.missing_extensions.join(", ")
             ));
         }
+        if !f.vanished_extensions.is_empty() {
+            return Err(format!(
+                "расширения из индекса исчезли с диска: {} — нужна полная сборка: \
+                 gyrfalcon build <путь> --out <файл>",
+                f.vanished_extensions.join(", ")
+            ));
+        }
         // Обход считает и .xml, а инкремент их не берёт: показываем оба
         // числа, чтобы «учтено меньше, чем изменилось» не выглядело потерей.
         файлы = собрать_изменившиеся(&src, info.built_at);
