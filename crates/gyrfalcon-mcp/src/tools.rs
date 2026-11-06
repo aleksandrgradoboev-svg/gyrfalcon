@@ -2180,13 +2180,25 @@ fn оглавление_модуля(conn: &Connection, module: &str) -> Result<
         .map_err(|e| e.to_string())?
         .filter_map(std::result::Result::ok)
         .collect();
+    let ключ = module.trim_matches('/').to_lowercase();
     let точно: Vec<&(i64, String, i64)> = кандидаты
         .iter()
-        .filter(|(_, п, _)| п.to_lowercase() == module.to_lowercase())
+        .filter(|(_, п, _)| п.to_lowercase() == ключ)
         .collect();
-    let выбран = match (точно.as_slice(), кандидаты.as_slice()) {
+    // Имя модуля вместо пути (`ОбщегоНазначения`) — точный сегмент пути. Без
+    // этого живой вызов на ДО давал 20+ кандидатов `ОбщегоНазначенияБПО…`.
+    let сегмент: Vec<&(i64, String, i64)> = кандидаты
+        .iter()
+        .filter(|(_, п, _)| п.to_lowercase().split('/').any(|часть| часть == ключ))
+        .collect();
+    let лучшие: Vec<&(i64, String, i64)> = if точно.is_empty() {
+        сегмент
+    } else {
+        точно
+    };
+    let выбран = match (лучшие.as_slice(), кандидаты.as_slice()) {
         ([один], _) => (*один).clone(),
-        ([], [один]) => один.clone(),
+        (_, [один]) => один.clone(),
         (_, []) => {
             return Err(format!(
                 "модуль ~ '{module}' не найден в индексе. Путь модуля — find с \
@@ -2195,19 +2207,25 @@ fn оглавление_модуля(conn: &Connection, module: &str) -> Result<
             ))
         }
         _ => {
+            // Точные совпадения сегмента — первыми: среди них и выбирают.
+            let показ: Vec<&(i64, String, i64)> = лучшие
+                .iter()
+                .copied()
+                .chain(кандидаты.iter().filter(|к| !лучшие.contains(к)))
+                .collect();
             return Ok(json!({
                 "ambiguous": true,
                 "note": format!(
                     "под '{module}' подходит модулей: {}; уточните module (путь целиком \
                      или его уникальная часть). Кандидаты — [путь, методов]{}",
-                    кандидаты.len(),
-                    if кандидаты.len() > КАНДИДАТОВ_МОДУЛЯ {
+                    показ.len(),
+                    if показ.len() > КАНДИДАТОВ_МОДУЛЯ {
                         format!(", показаны первые {КАНДИДАТОВ_МОДУЛЯ}")
                     } else {
                         String::new()
                     }
                 ),
-                "candidates": кандидаты.iter().take(КАНДИДАТОВ_МОДУЛЯ)
+                "candidates": показ.iter().take(КАНДИДАТОВ_МОДУЛЯ)
                     .map(|(_, п, n)| json!([п, n])).collect::<Vec<_>>()
             }));
         }
@@ -2228,6 +2246,15 @@ fn оглавление_модуля(conn: &Connection, module: &str) -> Result<
          ORDER BY m.line",
         &[&id],
     )?;
+    // Параметры в индексе — сырой текст объявления, с переносами и отступами
+    // многострочных списков: на живом модуле это заметная доля ответа.
+    if let Some(строки) = методы["rows"].as_array_mut() {
+        for ряд in строки {
+            if let Some(Value::String(п)) = ряд.get_mut(6) {
+                *п = п.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+        }
+    }
     методы["note"] = json!("is_export: 1 — экспортный; тело метода — read с method и этим module");
     let пусто = методы["count"] == json!(0);
     let mut out = json!({"module": путь, "methods": методы});
@@ -2689,9 +2716,11 @@ mod tests {
         c.execute_batch(
             "INSERT INTO modules (id, rel_path, category, object_name, module_type, is_form) VALUES
                (1,'CommonModules/Сервис/Ext/Module.bsl','CommonModules','Сервис','Module',0),
-               (2,'../cfe/CommonModules/Сервис/Ext/Module.bsl','CommonModules','Сервис','Module',0);
+               (2,'../cfe/CommonModules/Сервис/Ext/Module.bsl','CommonModules','Сервис','Module',0),
+               (3,'CommonModules/СервисКлиент/Ext/Module.bsl','CommonModules','СервисКлиент','Module',0);
              INSERT INTO methods (module_id, name, type, is_export, params, line, end_line) VALUES
-               (1,'Внешний','Function',1,'Парам',5,9),
+               (1,'Внешний','Function',1,'(Парам,
+		Второй = 1)',5,9),
                (1,'Служебный','Procedure',0,'',12,14),
                (2,'Расш_Внешний','Function',0,'Парам',3,6);
              INSERT INTO regions (module_id, name, line, end_line) VALUES
@@ -2716,7 +2745,7 @@ mod tests {
                     5,
                     9,
                     "ПрограммныйИнтерфейс",
-                    "Парам"
+                    "(Парам, Второй = 1)"
                 ],
                 ["Служебный", "Procedure", 0, 12, 14, "Вложенная"]
             ]),
@@ -2724,6 +2753,21 @@ mod tests {
         );
         let v = read(&c, &json!({"module": "../cfe/"})).unwrap();
         assert_eq!(v["methods"]["count"], 1, "модуль расширения: {v:#}");
+
+        // Имя модуля вместо пути: `СервисКлиент` не мешает, точный сегмент побеждает.
+        let v = read(&c, &json!({"module": "СервисКлиент"})).unwrap();
+        assert_eq!(
+            v["module"], "CommonModules/СервисКлиент/Ext/Module.bsl",
+            "{v:#}"
+        );
+        // `Сервис` — точный сегмент у основной и у расширения: выбирать не за кого,
+        // но они идут первыми, впереди `СервисКлиент`.
+        let v = read(&c, &json!({"module": "Сервис"})).unwrap();
+        assert_eq!(v["ambiguous"], true, "{v:#}");
+        assert_eq!(
+            v["candidates"][2][0], "CommonModules/СервисКлиент/Ext/Module.bsl",
+            "{v:#}"
+        );
     }
 
     /// Карточка объекта называет его модули (без форм) с числом методов —
