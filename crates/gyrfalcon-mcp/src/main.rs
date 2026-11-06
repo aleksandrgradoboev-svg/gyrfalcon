@@ -101,9 +101,10 @@ fn print_help() {
                       MCP-сервер (по умолчанию stdio — для клиента вроде Claude Code)
   ui --db <файл.db> [--port 8787]
                       визуальная карта: движения, подсистемы, расширения
-  install [--harness claude|kilo|codex] [--db <файл>] [--plan] [--force]
+  install [--harness claude|kilo|codex] [--db <файл>] [--server-url <адрес>] [--plan] [--force]
                       разложить скилл (правило, когда звать инструменты) и роли;
-                      файлы прежней версии, не правленные вручную, обновляются сами
+                      файлы прежней версии, не правленные вручную, обновляются сами;
+                      --server-url — роли под один сервер по адресу (профиль all)
   skill               напечатать скилл с отметкой версии (то же, что кладёт install)
   status              состояние переноса схемы индекса
   build <путь> --out <файл> [--dict <словарь.db>]  собрать индекс: код, метаданные, семантика
@@ -525,6 +526,7 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     let mut plan = false;
     let mut force = false;
     let mut db = String::from("<путь к индексу>");
+    let mut url: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -541,6 +543,10 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
                 i += 1;
                 db = args.get(i).ok_or("--db без значения")?.clone();
             }
+            "--server-url" => {
+                i += 1;
+                url = Some(args.get(i).ok_or("--server-url без значения")?.clone());
+            }
             "--plan" => plan = true,
             "--force" => force = true,
             other => return Err(format!("неизвестный параметр: {other}")),
@@ -551,20 +557,30 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         харнесы = install::Harness::ALL.to_vec();
     }
 
-    for д in install::install(&харнесы, plan, force) {
+    let подключение = if url.is_some() {
+        install::Подключение::ОдинСервер
+    } else {
+        install::Подключение::ПоПрофилям
+    };
+    for д in install::install(&харнесы, plan, force, подключение) {
         println!("{:<12} {:<6} {}", д.харнес, д.что, д.итог);
         if !д.куда.as_os_str().is_empty() {
             println!("             {}", д.куда.display());
         }
     }
     println!("\nФрагменты конфигурации — вписать самостоятельно.");
-    println!("Серверов ТРИ, по одному на профиль: урезание набора инструментов");
-    println!("держится запуском сервера, а не текстом роли.");
+    if url.is_some() {
+        println!("Сервер ОДИН, по адресу, профиль all: набор инструментов уровня");
+        println!("держит харнес по списку в роли.");
+    } else {
+        println!("Серверов ТРИ, по одному на профиль: урезание набора инструментов");
+        println!("держится запуском сервера, а не текстом роли.");
+    }
     for h in харнесы {
         println!(
             "\n=== {} — MCP ===\n{}",
             h.name(),
-            install::фрагмент(h, &db)
+            install::фрагмент(h, &db, url.as_deref())
         );
         let хуки = install::фрагмент_хуков(h);
         if !хуки.is_empty() {
