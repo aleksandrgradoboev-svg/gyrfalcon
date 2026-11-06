@@ -545,7 +545,15 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             }
             "--server-url" => {
                 i += 1;
-                url = Some(args.get(i).ok_or("--server-url без значения")?.clone());
+                let v = args.get(i).ok_or("--server-url без значения")?;
+                // Адрес вписывается в JSON/TOML как есть — кавычка, обратный
+                // слэш или пробел дали бы битый фрагмент.
+                if v.chars()
+                    .any(|c| c == '"' || c == '\\' || c.is_whitespace())
+                {
+                    return Err(format!("недопустимый адрес сервера: {v}"));
+                }
+                url = Some(v.clone());
             }
             "--plan" => plan = true,
             "--force" => force = true,
@@ -555,6 +563,9 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     }
     if харнесы.is_empty() {
         харнесы = install::Harness::ALL.to_vec();
+    }
+    if url.is_some() && db != "<путь к индексу>" {
+        return Err("--db не нужен с --server-url: индексы выбирает запущенный сервис".into());
     }
 
     let подключение = if url.is_some() {

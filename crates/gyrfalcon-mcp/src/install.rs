@@ -400,22 +400,25 @@ fn вне_уровня(t: Tier) -> Vec<&'static str> {
 /// здесь дешевле, чем роль, работающая без правил.
 pub fn роль(h: Harness, t: Tier, п: Подключение) -> String {
     let сервер = имя_сервера(t, п);
-    let инстр: Vec<String> = t
-        .инструменты()
-        .iter()
-        .map(|i| format!("mcp__{сервер}__{i}"))
-        .collect();
     match h {
         // Шапка Kilo — не шапка Claude Code: `tools` здесь объект
         // имя → bool, read-only держит `permission`, а поля `mcpServers`,
         // `permissionMode`, `skills` Kilo не читает. Встроенный поиск
-        // закрыт: навигация роли идёт через индекс. Инструменты сервера вне
-        // уровня закрыты поимённо (`<сервер>_<инструмент>`).
+        // закрыт: навигация роли идёт через индекс. Инструменты своего
+        // сервера вне уровня закрыты поимённо (`<сервер>_<инструмент>`).
+        // Инструменты MCP Kilo даёт агенту со ВСЕХ подключённых серверов,
+        // поэтому при сервере на профиль чужие серверы gyrfalcon закрыты
+        // целиком шаблоном — иначе разведчик дотянулся бы до `sql` аудитора.
         Harness::Kilo => {
-            let запреты = вне_уровня(t)
+            let mut запреты = вне_уровня(t)
                 .iter()
                 .map(|i| format!("  {сервер}_{i}: false\n"))
                 .collect::<String>();
+            if п == Подключение::ПоПрофилям {
+                for чужой in Tier::ALL.iter().filter(|x| **x != t) {
+                    запреты.push_str(&format!("  \"{}_*\": false\n", имя_сервера(*чужой, п)));
+                }
+            }
             format!(
                 "---\n\
                  description: \"{}\"\n\
@@ -439,10 +442,11 @@ pub fn роль(h: Harness, t: Tier, п: Подключение) -> String {
             t.описание().replace('"', "'"),
             AGENTS
         ),
-        _ => {
-            let список = инстр
+        Harness::ClaudeCode => {
+            let список = t
+                .инструменты()
                 .iter()
-                .map(|i| format!("  - {i}\n"))
+                .map(|i| format!("  - mcp__{сервер}__{i}\n"))
                 .collect::<String>();
             format!(
                 "---\n\
@@ -1229,9 +1233,19 @@ mod tests_agents {
                 i.name
             );
         }
-        // Под три сервера запреты — с именем своего сервера.
+        // Под три сервера запреты — с именем своего сервера, а чужие
+        // серверы gyrfalcon закрыты целиком: Kilo видит все подключённые.
         let r = роль(Harness::Kilo, Tier::Scout, П);
         assert!(r.contains("  gyrfalcon-scout_sql: false\n"), "{r}");
+        assert!(r.contains("  \"gyrfalcon_*\": false\n"), "{r}");
+        assert!(r.contains("  \"gyrfalcon-all_*\": false\n"), "{r}");
+        assert!(
+            !r.contains("\"gyrfalcon-scout_*\""),
+            "свой сервер закрыт: {r}"
+        );
+        // Под один сервер чужих серверов нет — и шаблонов тоже.
+        let r = роль(Harness::Kilo, Tier::Scout, О);
+        assert!(!r.contains("_*"), "{r}");
     }
 
     #[test]
