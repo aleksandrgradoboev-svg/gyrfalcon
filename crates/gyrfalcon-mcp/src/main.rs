@@ -728,11 +728,19 @@ fn cmd_update(args: &[String]) -> Result<(), String> {
 
     if файлы.is_empty() {
         println!("Ищу изменившиеся файлы в {} …", src.display());
-        let f =
-            gyrfalcon_index::freshness::check(info.built_at, &info.source_path, &info.git_commit);
+        let f = info.freshness();
         if !f.stale {
             println!("Индекс не отстал — пересобирать нечего.");
             return Ok(());
+        }
+        // Инкремент берёт раскладку расширений из реестра индекса: расширение,
+        // которого там нет, он разобрал бы как чужую категорию `..`.
+        if !f.missing_extensions.is_empty() {
+            return Err(format!(
+                "на диске есть расширения, которых нет в индексе: {} — нужна полная \
+                 сборка: gyrfalcon build <путь> --out <файл>",
+                f.missing_extensions.join(", ")
+            ));
         }
         // Обход считает и .xml, а инкремент их не берёт: показываем оба
         // числа, чтобы «учтено меньше, чем изменилось» не выглядело потерей.
