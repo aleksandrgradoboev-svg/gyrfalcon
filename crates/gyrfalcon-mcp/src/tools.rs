@@ -132,7 +132,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "object",
         description: "Карточка объекта метаданных: реквизиты с ТИПАМИ и квалификаторами, \
-             табличные части, синонимы, предопределённые, формы, движения по регистрам, \
+             табличные части, синонимы, предопределённые, формы, модули, движения по регистрам, \
              ввод на основании в обе стороны (based_on — на основании чего вводится \
              объект, basis_for — что вводится на основании него). \
              Собирается из нескольких таблиц за один вызов — не нужно спрашивать по частям. \
@@ -157,8 +157,10 @@ pub const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "read",
-        description: "Прочитать ТЕЛО ОДНОГО метода по адресу из индекса. Не файл и не модуль: \
-             сначала find, потом read по найденному адресу.",
+        description: "Прочитать ТЕЛО ОДНОГО метода по адресу из индекса — или, без method, \
+             ОГЛАВЛЕНИЕ модуля: все его методы с типом, экспортом, строками и областью, \
+             без тел. Файл целиком не отдаёт. Что в модуле — read по module; модули \
+             объекта — раздел modules карточки object; потом read по методу.",
         schema: schema_read,
     },
     Tool {
@@ -323,7 +325,7 @@ fn schema_object() -> Value {
             "category": {"type": "string", "description":
                 "Категория (Catalogs/Documents/…), если имя неоднозначно"},
             "parts": {"type": "array", "items": {"type": "string"}, "description":
-                "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, rights, options, subscriptions, scheduled_jobs. \
+                "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, modules, rights, options, subscriptions, scheduled_jobs. \
                  По умолчанию — всё, кроме forms (их бывает много)"}
         }),
         &["name"],
@@ -384,10 +386,12 @@ fn schema_detect_changes() -> Value {
 fn schema_read() -> Value {
     обяз(
         json!({
-            "method": {"type": "string"},
-            "module": {"type": "string", "description": "Подстрока пути модуля"}
+            "method": {"type": "string", "description":
+                "Имя метода. Не задан (или *) — оглавление модуля из module"},
+            "module": {"type": "string", "description":
+                "Подстрока пути модуля. Без method — список его методов: тип, экспорт, строки, область"}
         }),
-        &["method"],
+        &[],
     )
 }
 
@@ -1507,6 +1511,7 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                 "options",
                 "subscriptions",
                 "scheduled_jobs",
+                "modules",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -1643,11 +1648,30 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&name, &кат],
         )?;
     }
+    if есть("modules") {
+        // Модули самого объекта (без форм — их бывает десятки, они в forms).
+        // Нужны, чтобы от карточки дойти до оглавления модуля `read` без `sql`:
+        // в живом прогоне слабая модель угадывала колонки `modules` трижды.
+        out["modules"] = выборка(
+            conn,
+            &format!(
+                "SELECT rel_path, module_type,
+                        (SELECT count(*) FROM methods m WHERE m.module_id = mo.id) AS methods{кол_категории}
+                 FROM modules mo
+                 WHERE object_name = ?1 COLLATE NOCASE AND is_form = 0
+                   AND (?2 IS NULL OR category = ?2)
+                 ORDER BY {порядок_категории}rel_path"
+            ),
+            &[&name, &кат],
+        )?;
+        out["modules"]["note"] =
+            json!("оглавление модуля — read с module = rel_path; модули форм — через forms");
+    }
     if тёзки {
         // Пометка с числами по категориям — чтобы «сведены по всем» читалось
         // как «37 = 5 + 32», а не как «у объекта 37 реквизитов».
         let mut по_разделам = Vec::new();
-        for раздел in ["attributes", "predefined", "forms"] {
+        for раздел in ["attributes", "predefined", "forms", "modules"] {
             let Some(строки) = out.get(раздел).and_then(|v| v["rows"].as_array())
             else {
                 continue;
@@ -1676,6 +1700,7 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             ("based_on", "based_on.category"),
             ("basis_for", "basis_for.basis"),
             ("forms", "forms.category"),
+            ("modules", "modules.category"),
             ("rights", "rights.element"),
             ("options", "options.elements"),
             ("subscriptions", "subscriptions.objects"),
@@ -2028,8 +2053,22 @@ fn impact(conn: &Connection, args: &Value) -> Result<Value, String> {
 }
 
 fn read(conn: &Connection, args: &Value) -> Result<Value, String> {
-    let method = строка(args, "method").ok_or("нужен параметр method")?;
+    let method = строка(args, "method").filter(|m| !m.trim().is_empty() && m.trim() != "*");
     let module = строка(args, "module").unwrap_or_default();
+    // Без метода — оглавление модуля. До 06.11.2026 `read` требовал имя
+    // метода, и слабая модель в живом прогоне трижды угадывала колонки `sql`
+    // и имена методов (`read` с `*`), чтобы просто узнать, что в модуле есть.
+    // `*` принимается ровно потому, что модель пробовала именно его.
+    let Some(method) = method else {
+        if module.trim().is_empty() {
+            return Err(
+                "нужен параметр method (тело метода) или module (оглавление \
+                        модуля: методы с экспортом и строками)"
+                    .into(),
+            );
+        }
+        return оглавление_модуля(conn, &module);
+    };
 
     let mut st = conn
         .prepare(
@@ -2114,6 +2153,89 @@ fn read(conn: &Connection, args: &Value) -> Result<Value, String> {
         "line": line, "end_line": end_line,
         "body": тело
     }))
+}
+
+/// Сколько модулей-кандидатов показывать при неоднозначном `module`.
+const КАНДИДАТОВ_МОДУЛЯ: usize = 20;
+
+/// Оглавление модуля: методы по порядку строк, без тел.
+///
+/// Модуль ищется подстрокой пути, как в `read` по методу. Точное совпадение
+/// пути побеждает подстроку: `Documents/А/Ext/ObjectModule.bsl` не должен
+/// стать неоднозначным из-за соседнего `ManagerModule.bsl`, раз путь назван
+/// целиком. Сравнение — в Rust: `LIKE` SQLite кириллицу не понижает.
+fn оглавление_модуля(conn: &Connection, module: &str) -> Result<Value, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT mo.id, mo.rel_path,
+                    (SELECT count(*) FROM methods m WHERE m.module_id = mo.id)
+             FROM modules mo WHERE mo.rel_path LIKE ?1
+             ORDER BY length(mo.rel_path), mo.rel_path",
+        )
+        .map_err(|e| e.to_string())?;
+    let кандидаты: Vec<(i64, String, i64)> = st
+        .query_map([format!("%{module}%")], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    let точно: Vec<&(i64, String, i64)> = кандидаты
+        .iter()
+        .filter(|(_, п, _)| п.to_lowercase() == module.to_lowercase())
+        .collect();
+    let выбран = match (точно.as_slice(), кандидаты.as_slice()) {
+        ([один], _) => (*один).clone(),
+        ([], [один]) => один.clone(),
+        (_, []) => {
+            return Err(format!(
+                "модуль ~ '{module}' не найден в индексе. Путь модуля — find с \
+                 kind: module; это может значить и то, что модуль не \
+                 проиндексирован — проверьте инструментом coverage"
+            ))
+        }
+        _ => {
+            return Ok(json!({
+                "ambiguous": true,
+                "note": format!(
+                    "под '{module}' подходит модулей: {}; уточните module (путь целиком \
+                     или его уникальная часть). Кандидаты — [путь, методов]{}",
+                    кандидаты.len(),
+                    if кандидаты.len() > КАНДИДАТОВ_МОДУЛЯ {
+                        format!(", показаны первые {КАНДИДАТОВ_МОДУЛЯ}")
+                    } else {
+                        String::new()
+                    }
+                ),
+                "candidates": кандидаты.iter().take(КАНДИДАТОВ_МОДУЛЯ)
+                    .map(|(_, п, n)| json!([п, n])).collect::<Vec<_>>()
+            }));
+        }
+    };
+    let (id, путь, _) = выбран;
+    // Область — самая внутренняя из охватывающих строку объявления: начата
+    // позже всех, а при одной строке начала — кончается раньше.
+    let mut методы = выборка(
+        conn,
+        "SELECT m.name, m.type, m.is_export, m.line, m.end_line,
+                (SELECT r.name FROM regions r
+                  WHERE r.module_id = m.module_id AND r.line <= m.line
+                    AND (r.end_line IS NULL OR r.end_line >= m.line)
+                  ORDER BY r.line DESC, coalesce(r.end_line, 9223372036854775807)
+                  LIMIT 1) AS region,
+                NULLIF(m.params, '') AS params
+         FROM methods m WHERE m.module_id = ?1
+         ORDER BY m.line",
+        &[&id],
+    )?;
+    методы["note"] = json!("is_export: 1 — экспортный; тело метода — read с method и этим module");
+    let пусто = методы["count"] == json!(0);
+    let mut out = json!({"module": путь, "methods": методы});
+    if пусто {
+        // Модуль без методов (только переменные или пустой) — факт, а не сбой.
+        out["note"] = json!("в модуле нет процедур и функций");
+    }
+    Ok(out)
 }
 
 fn overrides(conn: &Connection, args: &Value) -> Result<Value, String> {
@@ -2512,6 +2634,123 @@ mod tests {
         let v = и.вызвать(json!({"method": "НетТакогоМетода"}));
         assert_eq!(v["found"], false, "{v:#}");
         assert!(v["note"].as_str().unwrap().contains("find"), "{v:#}");
+    }
+
+    /// Оглавление модуля настоящей сборкой: методы по строкам, без тел;
+    /// `*` вместо метода — то же самое, а не поиск метода по имени `*`.
+    #[test]
+    fn read_без_метода_отдаёт_оглавление_модуля() {
+        let и = ИндексВызовов::новый("toc");
+        let c = Connection::open(и.0.join("i.db")).unwrap();
+        for a in [
+            json!({"module": "Documents/А/"}),
+            json!({"module": "Documents/А/", "method": "*"}),
+        ] {
+            let v = read(&c, &a).unwrap();
+            assert_eq!(v["module"], "Documents/А/Ext/ObjectModule.bsl", "{v:#}");
+            let имена: Vec<&str> = v["methods"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r[0].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                имена,
+                ["Верх", "ОбработкаЗаполнения", "ЗаполнитьПоЗаказуКлиента"],
+                "{v:#}"
+            );
+            assert!(v.get("body").is_none(), "тел в оглавлении нет: {v:#}");
+        }
+    }
+
+    /// Подходят несколько модулей — кандидаты с числом методов, а не первый попавшийся;
+    /// не подходит ни один — отказ с причиной; ни method, ни module — отказ.
+    #[test]
+    fn read_оглавление_неоднозначно_и_не_найдено() {
+        let и = ИндексВызовов::новый("toc-ambiguous");
+        let c = Connection::open(и.0.join("i.db")).unwrap();
+        let v = read(&c, &json!({"module": "ObjectModule"})).unwrap();
+        assert_eq!(v["ambiguous"], true, "{v:#}");
+        assert_eq!(v["candidates"].as_array().unwrap().len(), 2, "{v:#}");
+        assert_eq!(v["candidates"][0][1], 3, "число методов: {v:#}");
+
+        let e = read(&c, &json!({"module": "CommonModules/Нет"})).unwrap_err();
+        assert!(e.contains("не найден") && e.contains("coverage"), "{e}");
+        let e = read(&c, &json!({})).unwrap_err();
+        assert!(e.contains("module"), "{e}");
+    }
+
+    /// Путь основной конфигурации — подстрока пути того же модуля в расширении
+    /// (`../cfe/…`). Названный целиком путь побеждает, а не делает выбор неоднозначным;
+    /// область метода — самая внутренняя.
+    #[test]
+    fn read_оглавление_точный_путь_побеждает_и_область() {
+        let c = индекс_объектов();
+        c.execute_batch(
+            "INSERT INTO modules (id, rel_path, category, object_name, module_type, is_form) VALUES
+               (1,'CommonModules/Сервис/Ext/Module.bsl','CommonModules','Сервис','Module',0),
+               (2,'../cfe/CommonModules/Сервис/Ext/Module.bsl','CommonModules','Сервис','Module',0);
+             INSERT INTO methods (module_id, name, type, is_export, params, line, end_line) VALUES
+               (1,'Внешний','Function',1,'Парам',5,9),
+               (1,'Служебный','Procedure',0,'',12,14),
+               (2,'Расш_Внешний','Function',0,'Парам',3,6);
+             INSERT INTO regions (module_id, name, line, end_line) VALUES
+               (1,'ПрограммныйИнтерфейс',1,10),
+               (1,'СлужебныеПроцедуры',11,20),
+               (1,'Вложенная',11,15);",
+        )
+        .unwrap();
+        let v = read(
+            &c,
+            &json!({"module": "CommonModules/Сервис/Ext/Module.bsl"}),
+        )
+        .unwrap();
+        assert_eq!(v["module"], "CommonModules/Сервис/Ext/Module.bsl", "{v:#}");
+        assert_eq!(
+            v["methods"]["rows"],
+            json!([
+                [
+                    "Внешний",
+                    "Function",
+                    1,
+                    5,
+                    9,
+                    "ПрограммныйИнтерфейс",
+                    "Парам"
+                ],
+                ["Служебный", "Procedure", 0, 12, 14, "Вложенная"]
+            ]),
+            "{v:#}"
+        );
+        let v = read(&c, &json!({"module": "../cfe/"})).unwrap();
+        assert_eq!(v["methods"]["count"], 1, "модуль расширения: {v:#}");
+    }
+
+    /// Карточка объекта называет его модули (без форм) с числом методов —
+    /// мост к оглавлению `read` без `sql`.
+    #[test]
+    fn object_модули_объекта_без_форм() {
+        let c = индекс_объектов();
+        c.execute_batch(
+            "INSERT INTO modules (id, rel_path, category, object_name, module_type, form_name, is_form) VALUES
+               (1,'Documents/Р/Ext/ObjectModule.bsl','Documents','РеализацияТоваровУслуг','ObjectModule',NULL,0),
+               (2,'Documents/Р/Ext/ManagerModule.bsl','Documents','РеализацияТоваровУслуг','ManagerModule',NULL,0),
+               (3,'Documents/Р/Forms/Ф/Ext/Form/Module.bsl','Documents','РеализацияТоваровУслуг','FormModule','Ф',1);
+             INSERT INTO methods (module_id, name, type, line, end_line) VALUES
+               (1,'ОбработкаПроведения','Procedure',1,3),
+               (1,'ПередЗаписью','Procedure',4,6),
+               (3,'ПриОткрытии','Procedure',1,2);",
+        )
+        .unwrap();
+        let v = object(&c, &json!({"name": "РеализацияТоваровУслуг"})).unwrap();
+        assert_eq!(
+            v["modules"]["rows"],
+            json!([
+                ["Documents/Р/Ext/ManagerModule.bsl", "ManagerModule", 0],
+                ["Documents/Р/Ext/ObjectModule.bsl", "ObjectModule", 2]
+            ]),
+            "{v:#}"
+        );
     }
 
     /// Реестр объектов типовой УТ в миниатюре.
