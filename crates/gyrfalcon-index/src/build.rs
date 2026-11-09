@@ -516,7 +516,7 @@ fn write_calls(
         acc += m.parsed.methods.len() as i64;
     }
 
-    let resolved: Vec<(i64, resolve::ResolvedCall)> = parsed
+    let resolved: Vec<(i64, u32, resolve::ResolvedCall)> = parsed
         .par_iter()
         .enumerate()
         .flat_map(|(i, m)| {
@@ -528,7 +528,11 @@ fn write_calls(
                     // Вызовы вне метода в граф не идут: у ребра нет источника.
                     let caller = c.caller?;
                     let caller_id = base_id + caller as i64 + 1;
-                    Some((caller_id, resolve::resolve(&c.name, &m.rel_path, tables)))
+                    Some((
+                        caller_id,
+                        c.line,
+                        resolve::resolve(&c.name, &m.rel_path, tables),
+                    ))
                 })
                 .collect::<Vec<_>>()
         })
@@ -537,13 +541,14 @@ fn write_calls(
     let tx = conn.transaction()?;
     {
         let mut ins = tx.prepare(
-            "INSERT INTO calls (caller_id, callee_name, callee_key, resolution, confidence)
-             VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO calls (caller_id, callee_name, line, callee_key, resolution, confidence)
+             VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
-        for (caller_id, r) in &resolved {
+        for (caller_id, line, r) in &resolved {
             ins.execute(rusqlite::params![
                 caller_id,
                 r.callee_name,
+                i64::from(*line),
                 r.callee_key,
                 r.resolution.as_str(),
                 r.confidence,

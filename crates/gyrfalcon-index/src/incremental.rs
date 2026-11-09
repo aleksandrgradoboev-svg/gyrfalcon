@@ -318,11 +318,12 @@ pub fn update(db: &Path, src: &Path, files: &[std::path::PathBuf]) -> Result<Inc
                 let caller_id = первый_метод + caller as i64;
                 let r = resolve::resolve(&c.name, &d.rel_path, &tables);
                 tx.execute(
-                    "INSERT INTO calls (caller_id, callee_name, callee_key, resolution, confidence)
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO calls (caller_id, callee_name, line, callee_key, resolution, confidence)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
                     rusqlite::params![
                         caller_id,
                         r.callee_name,
+                        i64::from(c.line),
                         r.callee_key,
                         r.resolution.as_str(),
                         r.confidence
@@ -560,6 +561,31 @@ mod tests {
             ),
             1,
             "новый метод обязан появиться"
+        );
+    }
+
+    #[test]
+    fn строка_вызова_пишется_в_полной_и_инкрементальной_сборке() {
+        // Колонка `line` была в схеме и в выдаче `callers`, но сборка её не
+        // заполняла: на живом индексе места вызовов приходили пустыми.
+        let к = Корпус::новый("строка-вызова");
+        к.собрать();
+        let строка = "SELECT line FROM calls WHERE callee_name='Расчёты.Посчитать'";
+        assert_eq!(счёт(&к.индекс(), строка), 2, "полная сборка");
+
+        let объект = к
+            .путь()
+            .join("Catalogs/Номенклатура/Ext/ObjectModule/Module.bsl");
+        fs::write(
+            &объект,
+            "Процедура ПередЗаписью(Отказ)\n\t// сдвиг\n\tРасчёты.Посчитать(1);\nКонецПроцедуры\n",
+        )
+        .unwrap();
+        update(&к.индекс(), к.путь(), &[объект]).unwrap();
+        assert_eq!(счёт(&к.индекс(), строка), 3, "инкремент");
+        assert_eq!(
+            счёт(&к.индекс(), "SELECT count(*) FROM calls WHERE line IS NULL"),
+            0
         );
     }
 
