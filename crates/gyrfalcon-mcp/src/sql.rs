@@ -208,7 +208,7 @@ pub fn run(conn: &Connection, sql: &str, limit: usize) -> Result<Value, SqlError
 
     let mut stmt = conn
         .prepare(&проверен)
-        .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+        .map_err(|e| SqlError::Sqlite(с_подсказкой(conn, &проверен, e.to_string())))?;
     let колонки: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let ширина = колонки.len();
 
@@ -239,6 +239,62 @@ pub fn run(conn: &Connection, sql: &str, limit: usize) -> Result<Value, SqlError
         "truncated": усечено,
         "limit": лимит,
     }))
+}
+
+/// Дописать к «no such column» настоящие столбцы таблиц, названных в запросе.
+///
+/// Голый текст SQLite называет только промах, и агент идёт по кругу
+/// `sql` → ошибка → `schema` → `sql`: в замере на прогоне вопросов это была
+/// бОльшая часть ошибок инструментов. Столбцы тех же таблиц в той же ошибке
+/// разрывают круг за один шаг.
+///
+/// Таблицы ищутся пересечением слов запроса со списком таблиц и
+/// представлений индекса, а не разбором `FROM`/`JOIN`: так не теряются
+/// перечисление через запятую, подзапросы и псевдонимы, а имя CTE в индексе
+/// не значится и само выпадает. Лишняя таблица (слово совпало с именем
+/// таблицы случайно) стоит строки в ошибке; пропущенная — ещё одного круга.
+fn с_подсказкой(conn: &Connection, запрос: &str, ошибка: String) -> String {
+    if !ошибка.contains("no such column") {
+        return ошибка;
+    }
+    let слова: std::collections::HashSet<String> = запрос
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    // Подсказка — добавка к ошибке, а не новая ошибка: сбой чтения схемы
+    // даёт пустой список, исходный текст SQLite остаётся в начале ответа.
+    let имена = |q: &str, p: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+        conn.prepare(q)
+            .and_then(|mut st| {
+                st.query_map(p, |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default()
+    };
+    let таблицы: Vec<String> = имена(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name",
+        &[],
+    )
+    .into_iter()
+    .filter(|t| слова.contains(&t.to_lowercase()))
+    .collect();
+    if таблицы.is_empty() {
+        return format!(
+            "{ошибка}. Таблицы индекса в запросе не распознаны — их столбцы покажет инструмент schema"
+        );
+    }
+    let описи: Vec<String> = таблицы
+        .iter()
+        .map(|t| {
+            let столбцы = имена("SELECT name FROM pragma_table_info(?1)", &[t]);
+            format!("{t}({})", столбцы.join(", "))
+        })
+        .collect();
+    format!(
+        "{ошибка}. Настоящие столбцы таблиц запроса: {}",
+        описи.join("; ")
+    )
 }
 
 fn значение(r: &rusqlite::Row<'_>, i: usize) -> Value {
@@ -350,6 +406,50 @@ mod tests {
         let c = база();
         match run(&c, "SELECT нет_такой_колонки FROM t", 10) {
             Err(SqlError::Sqlite(s)) => assert!(!s.is_empty()),
+            other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn нет_столбца_ошибка_называет_настоящие() {
+        let c = база();
+        c.execute_batch("CREATE TABLE u (id INTEGER, t_a INTEGER, имя TEXT);")
+            .unwrap();
+        // Псевдоним и соединение: столбцы обеих таблиц, и только их.
+        let q = "SELECT x.нет FROM t x JOIN u ON u.t_a = x.a";
+        match run(&c, q, 10) {
+            Err(SqlError::Sqlite(s)) => {
+                assert!(s.contains("no such column"), "{s}");
+                assert!(s.contains("t(a, b)"), "{s}");
+                assert!(s.contains("u(id, t_a, имя)"), "{s}");
+            }
+            other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
+        }
+        // Таблица, не названная в запросе, в подсказку не попадает.
+        match run(&c, "SELECT нет FROM t", 10) {
+            Err(SqlError::Sqlite(s)) => {
+                assert!(s.contains("t(a, b)"), "{s}");
+                assert!(!s.contains("u("), "лишняя таблица: {s}");
+            }
+            other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn нет_столбца_в_cte_отсылает_к_schema() {
+        // Имя CTE в индексе не значится — честно говорим, что таблиц не узнали.
+        let c = база();
+        match run(&c, "WITH w AS (SELECT 1 k) SELECT нет FROM w", 10) {
+            Err(SqlError::Sqlite(s)) => assert!(s.contains("schema"), "{s}"),
+            other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn прочие_ошибки_без_подсказки() {
+        let c = база();
+        match run(&c, "SELECT a FROM нет_таблицы", 10) {
+            Err(SqlError::Sqlite(s)) => assert!(!s.contains("Настоящие столбцы"), "{s}"),
             other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
         }
     }
