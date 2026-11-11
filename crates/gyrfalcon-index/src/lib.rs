@@ -46,6 +46,7 @@ pub type Result<T> = std::result::Result<T, IndexError>;
 
 pub mod build;
 pub mod classify;
+pub mod dcs;
 pub mod ddl;
 pub mod extensions;
 pub mod forms;

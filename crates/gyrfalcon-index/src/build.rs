@@ -20,6 +20,7 @@
 //! (имя + строка + владелец), это на порядок меньше исходников.
 
 use crate::classify::{self, ModuleInfo};
+use crate::dcs;
 use crate::ddl;
 use crate::extensions;
 use crate::forms;
@@ -83,6 +84,10 @@ pub struct BuildReport {
     pub form_elements: u64,
     /// Разобрано файлов форм — знаменатель для form_elements.
     pub forms: u64,
+    /// Схемы компоновки данных — записанные строки `dcs_schemas`.
+    pub dcs_schemas: u64,
+    /// Файлы СКД, которые не разобрались (испорченный XML).
+    pub dcs_unreadable: u64,
     /// Перехваты расширений — записанные строки `extension_overrides`.
     pub extension_overrides: u64,
     /// Перехваты, у которых цель НЕ разрешилась (нет модуля или метода
@@ -210,6 +215,8 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     write_usages(&mut conn, &parsed, &mut report)?;
     conn.execute_batch(ddl::SCHEMA_FORMS)?;
     write_forms(&mut conn, src, &корни, &mut report)?;
+    conn.execute_batch(ddl::SCHEMA_DCS)?;
+    write_dcs(&mut conn, src, &корни, &mut report)?;
     // Ссылки строятся ПОСЛЕ всех таблиц-источников: они читают их, а не файлы.
     // Перехваты расширений: читают уже записанные модули и методы основной
     // конфигурации, поэтому идут ПОСЛЕ них — резолвинг цели это SQL по
@@ -293,6 +300,7 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     conn.execute_batch(ddl::INDEXES_INTEGRATION)?;
     conn.execute_batch(ddl::INDEXES_USAGES)?;
     conn.execute_batch(ddl::INDEXES_FORMS)?;
+    conn.execute_batch(ddl::INDEXES_DCS)?;
     conn.execute_batch(ddl::INDEXES_EXTENSIONS)?;
     conn.execute_batch(ddl::INDEXES_REFS)?;
     conn.execute_batch(ddl::INDEXES_SEMANTIC)?;
@@ -1581,6 +1589,137 @@ fn write_forms(
     Ok(())
 }
 
+/// Записать схемы компоновки данных (MCP-04).
+///
+/// Разбор параллельный, запись одним потоком — как у форм. Заимствованный
+/// в расширение макет без изменений отбрасывается: ключ — владелец, макет
+/// и тексты запросов, без файла.
+fn write_dcs(
+    conn: &mut Connection,
+    src: &Path,
+    корни: &[extensions::Корень],
+    report: &mut BuildReport,
+) -> Result<()> {
+    let файлы: Vec<(&Path, dcs::TemplateFile)> = корни
+        .iter()
+        .flat_map(|к| {
+            dcs::files(&к.dir)
+                .into_iter()
+                .map(move |f| (к.dir.as_path(), f))
+        })
+        .collect();
+    let разобрано: Vec<Option<dcs::Schema>> = файлы
+        .par_iter()
+        .map(|(корень, (кат, владелец, макет, путь))| {
+            dcs::parse_file(корень, кат, владелец, макет, путь, &rel_of(src, путь))
+        })
+        .collect();
+    report.dcs_unreadable = разобрано.iter().filter(|s| s.is_none()).count() as u64;
+    let mut повторы = 0u64;
+    let схемы = без_повторов(
+        разобрано.into_iter().flatten().collect(),
+        |s: &dcs::Schema| &s.file,
+        |s| {
+            let запросы: Vec<&str> = s.datasets.iter().map(|d| d.query.as_str()).collect();
+            format!(
+                "{}|{}|{}|{}",
+                s.owner_category,
+                s.owner_name,
+                s.template,
+                запросы.join("\u{1}")
+            )
+            .to_lowercase()
+        },
+        &mut повторы,
+    );
+    report.extension_duplicates += повторы;
+
+    let tx = conn.transaction()?;
+    {
+        let mut ins_s = tx.prepare(
+            "INSERT INTO dcs_schemas (owner_category, owner_name, template, is_main, file)
+             VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        let mut ins_d = tx.prepare(
+            "INSERT INTO dcs_datasets (schema_id, name, kind, parent, object_name, query)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        let mut ins_src = tx.prepare(
+            "INSERT INTO dcs_sources (schema_id, dataset, object_ref, object_ref_key, member, kind)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        let mut ins_f = tx.prepare(
+            "INSERT INTO dcs_fields (schema_id, kind, dataset, data_path, field, title, expression, role)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
+        let mut ins_p = tx.prepare(
+            "INSERT INTO dcs_parameters (schema_id, name, title, expression, use, value_type)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        let mut ins_v = tx.prepare(
+            "INSERT INTO dcs_variants (schema_id, name, presentation) VALUES (?1,?2,?3)",
+        )?;
+        for s in &схемы {
+            ins_s.execute(rusqlite::params![
+                s.owner_category,
+                s.owner_name,
+                s.template,
+                i32::from(s.is_main),
+                s.file
+            ])?;
+            let id = tx.last_insert_rowid();
+            for d in &s.datasets {
+                ins_d.execute(rusqlite::params![
+                    id,
+                    d.name,
+                    d.kind,
+                    d.parent,
+                    d.object_name,
+                    d.query
+                ])?;
+                for x in &d.sources {
+                    ins_src.execute(rusqlite::params![
+                        id,
+                        d.name,
+                        x.object_ref,
+                        x.object_ref.to_lowercase(),
+                        x.member,
+                        x.kind
+                    ])?;
+                }
+            }
+            for f in &s.fields {
+                ins_f.execute(rusqlite::params![
+                    id,
+                    f.kind,
+                    f.dataset,
+                    f.data_path,
+                    f.field,
+                    f.title,
+                    f.expression,
+                    f.role
+                ])?;
+            }
+            for p in &s.parameters {
+                ins_p.execute(rusqlite::params![
+                    id,
+                    p.name,
+                    p.title,
+                    p.expression,
+                    p.use_,
+                    p.value_type
+                ])?;
+            }
+            for v in &s.variants {
+                ins_v.execute(rusqlite::params![id, v.name, v.presentation])?;
+            }
+        }
+    }
+    tx.commit()?;
+    report.dcs_schemas = схемы.len() as u64;
+    Ok(())
+}
+
 /// Записать ссылки между объектами метаданных.
 ///
 /// Источник — уже заполненные таблицы этого же индекса, а не файлы выгрузки.
@@ -2238,6 +2377,72 @@ mod tests {
                 .query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
                 .unwrap();
             assert!(n > 0, "таблица {t} пуста");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn сборка_пишет_схемы_компоновки() {
+        let dir = std::env::temp_dir().join("gyrfalcon-build-dcs");
+        let _ = std::fs::remove_dir_all(&dir);
+        корпус(&dir);
+        let t = dir.join("Reports/Остатки/Templates/Схема/Ext");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(
+            t.join("Template.xml"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <DataCompositionSchema xmlns=\"http://v8.1c.ru/8.1/data-composition-system/schema\" \
+               xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n\
+             <dataSet xsi:type=\"DataSetQuery\"><name>Н</name>\
+             <field xsi:type=\"DataSetFieldField\"><dataPath>Товар</dataPath><field>Товар</field></field>\
+             <query>ВЫБРАТЬ Т.Ссылка КАК Товар ИЗ Справочник.Товар КАК Т</query></dataSet>\n\
+             <totalField><dataPath>Кол</dataPath><expression>Сумма(Кол)</expression></totalField>\n\
+             <parameter><name>Период</name></parameter>\n\
+             </DataCompositionSchema>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Reports/Остатки.xml"),
+            "<MetaDataObject><Report><Properties><Name>Остатки</Name>\
+             <MainDataCompositionSchema>Report.Остатки.Template.Схема</MainDataCompositionSchema>\
+             </Properties></Report></MetaDataObject>",
+        )
+        .unwrap();
+        let db = dir.join("index.db");
+        let r = build(&dir, &db, None).unwrap();
+        assert_eq!(r.dcs_schemas, 1);
+        assert_eq!(r.dcs_unreadable, 0);
+        let conn = Connection::open(&db).unwrap();
+        let (кат, имя, основная): (String, String, i64) = conn
+            .query_row(
+                "SELECT owner_category, owner_name, is_main FROM dcs_schemas",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (кат.as_str(), имя.as_str(), основная),
+            ("Reports", "Остатки", 1)
+        );
+        let ключ: String = conn
+            .query_row(
+                "SELECT object_ref_key FROM dcs_sources WHERE kind = 'source'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ключ, "catalog.товар", "ключ понижен Rust, кириллица тоже");
+        for (таблица, n) in [
+            ("dcs_datasets", 1),
+            ("dcs_fields", 2),
+            ("dcs_parameters", 1),
+        ] {
+            let есть: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {таблица}"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(есть, n, "{таблица}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

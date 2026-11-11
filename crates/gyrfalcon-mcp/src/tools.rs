@@ -134,7 +134,8 @@ pub const TOOLS: &[Tool] = &[
         description: "Карточка объекта метаданных: реквизиты с ТИПАМИ и квалификаторами, \
              табличные части, синонимы, предопределённые, формы, модули, движения по регистрам, \
              ввод на основании в обе стороны (based_on — на основании чего вводится \
-             объект, basis_for — что вводится на основании него). \
+             объект, basis_for — что вводится на основании него), схемы компоновки \
+             отчёта (dcs) и какие отчёты читают объект (dcs_readers). \
              Собирается из нескольких таблиц за один вызов — не нужно спрашивать по частям. \
              Объекта нет — found: false и похожие имена (similar), без пустых разделов; \
              пустой раздел существующего объекта назван в empty_parts.",
@@ -325,8 +326,10 @@ fn schema_object() -> Value {
             "category": {"type": "string", "description":
                 "Категория (Catalogs/Documents/…), если имя неоднозначно"},
             "parts": {"type": "array", "items": {"type": "string"}, "description":
-                "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, modules, rights, options, subscriptions, scheduled_jobs. \
-                 По умолчанию — всё, кроме forms (их бывает много)"}
+                "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, modules, rights, options, subscriptions, scheduled_jobs, \
+                 dcs (схемы компоновки объекта: наборы, источники запросов, ресурсы, вычисляемые поля, параметры, варианты), \
+                 dcs_readers (какие СКД читают этот объект — регистр, документ, справочник). \
+                 По умолчанию — всё, кроме forms (их бывает много) и dcs_readers; dcs — только у отчётов"}
         }),
         &["name"],
     )
@@ -1558,7 +1561,7 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                 .collect()
         })
         .unwrap_or_else(|| {
-            [
+            let mut p: Vec<String> = [
                 "attributes",
                 "synonyms",
                 "predefined",
@@ -1574,7 +1577,15 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             ]
             .iter()
             .map(|s| s.to_string())
-            .collect()
+            .collect();
+            // Отчёт без схемы компоновки — редкость, и карточка отчёта без
+            // неё отвечает не на тот вопрос. У прочих объектов СКД бывает в
+            // макетах обработок, но по умолчанию не спрашивается: пустой
+            // раздел в каждой карточке документа — шум.
+            if категории.contains(&"Reports") {
+                p.push("dcs".into());
+            }
+            p
         });
     let есть = |p: &str| parts.iter().any(|x| x == p);
 
@@ -1805,6 +1816,20 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
     if есть("subscriptions") {
         out["subscriptions"] = подписки_объекта(conn, &name, &виды)?;
     }
+    if есть("dcs") {
+        out["dcs"] = if есть_таблица(conn, "dcs_schemas") {
+            схемы_компоновки(conn, &name, &кат)?
+        } else {
+            нет_таблицы("dcs_schemas")
+        };
+    }
+    if есть("dcs_readers") {
+        out["dcs_readers"] = if есть_таблица(conn, "dcs_sources") {
+            читатели_в_скд(conn, &полные)?
+        } else {
+            нет_таблицы("dcs_sources")
+        };
+    }
     if есть("scheduled_jobs") {
         // Обработчик задания — всегда общий модуль, и имя у него точное:
         // подстрокой `Заказ` цеплялись бы задания модуля `ЗаказыСервер`.
@@ -1828,6 +1853,124 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["empty_parts"] = json!(пустые);
     }
     Ok(out)
+}
+
+/// Схемы компоновки данных объекта: наборы, источники, ресурсы, вычисляемые
+/// поля, параметры, поля с ролью, варианты.
+///
+/// Текст запроса в карточку не кладётся: у «Ведомости по товарам на складах»
+/// УТ он 13 703 знака одного набора. В карточке — длина, сам текст — `sql`.
+fn схемы_компоновки(
+    conn: &Connection,
+    name: &str,
+    кат: &Option<String>,
+) -> Result<Value, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT id, owner_category, template, is_main, file FROM dcs_schemas
+             WHERE owner_name = ?1 AND (?2 IS NULL OR owner_category = ?2)
+             ORDER BY is_main DESC, template",
+        )
+        .map_err(|e| e.to_string())?;
+    let схемы: Vec<(i64, String, String, bool, String)> = st
+        .query_map(rusqlite::params![name, кат], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for (id, категория, макет, основная, файл) in &схемы {
+        out.push(json!({
+            "template": макет,
+            "category": категория,
+            "is_main": основная,
+            "file": файл,
+            "datasets": выборка(conn,
+                "SELECT name, kind, parent, object_name, length(query) AS query_len
+                 FROM dcs_datasets WHERE schema_id = ?1 ORDER BY id", &[id])?,
+            "sources": выборка(conn,
+                "SELECT dataset, object_ref, member, kind FROM dcs_sources
+                 WHERE schema_id = ?1 ORDER BY kind, object_ref, member, dataset", &[id])?,
+            "totals": выборка(conn,
+                "SELECT data_path, expression FROM dcs_fields
+                 WHERE schema_id = ?1 AND kind = 'total' ORDER BY rowid", &[id])?,
+            "calculated": выборка(conn,
+                "SELECT data_path, title, expression FROM dcs_fields
+                 WHERE schema_id = ?1 AND kind = 'calculated' ORDER BY rowid", &[id])?,
+            "parameters": выборка(conn,
+                "SELECT name, title, expression, use, value_type FROM dcs_parameters
+                 WHERE schema_id = ?1 ORDER BY rowid", &[id])?,
+            "fields_with_role": выборка(conn,
+                "SELECT dataset, data_path, title, role FROM dcs_fields
+                 WHERE schema_id = ?1 AND kind = 'field' AND role <> '' ORDER BY rowid", &[id])?,
+            "fields_total": conn.query_row(
+                "SELECT count(*) FROM dcs_fields WHERE schema_id = ?1 AND kind = 'field'",
+                [id], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())?,
+            "variants": выборка(conn,
+                "SELECT name, presentation FROM dcs_variants WHERE schema_id = ?1 ORDER BY rowid",
+                &[id])?,
+            "query_sql": format!("SELECT name, query FROM dcs_datasets WHERE schema_id = {id}"),
+        }));
+    }
+    Ok(json!({
+        "count": out.len(),
+        "schemas": out,
+        "note": "sources — упоминания в тексте запроса набора: source — таблица, \
+                 type — ссылочный тип, value — значение в ЗНАЧЕНИЕ(); источник отдельного \
+                 поля не восстанавливается. Текст запроса — sql из query_sql; все поля — \
+                 dcs_fields через sql",
+    }))
+}
+
+/// Какие схемы компоновки читают объект — по упоминаниям в текстах запросов.
+fn читатели_в_скд(conn: &Connection, полные: &[String]) -> Result<Value, String> {
+    let ключи: Vec<String> = полные.iter().map(|п| п.to_lowercase()).collect();
+    let mut rows = Vec::new();
+    let mut st = conn
+        .prepare(
+            "SELECT s.owner_category, s.owner_name, s.template, src.dataset, src.member, src.kind
+             FROM dcs_sources src JOIN dcs_schemas s ON s.id = src.schema_id
+             WHERE src.object_ref_key = ?1
+             ORDER BY src.kind, s.owner_category, s.owner_name, s.template, src.dataset",
+        )
+        .map_err(|e| e.to_string())?;
+    for к in &ключи {
+        let mut q = st.query([к]).map_err(|e| e.to_string())?;
+        while let Some(r) = q.next().map_err(|e| e.to_string())? {
+            let mut ряд = Vec::new();
+            for i in 0..6 {
+                ряд.push(значение(r, i));
+            }
+            rows.push(Value::Array(ряд));
+        }
+    }
+    // Потолок: `Хозрасчетный` в БП читают 390 наборов — 39 тыс. знаков в
+    // одном разделе карточки. Обрезка названа вслух, полный список — sql.
+    const ПОТОЛОК: usize = 200;
+    let всего = rows.len();
+    rows.truncate(ПОТОЛОК);
+    Ok(json!({
+        "columns": ["category", "owner", "template", "dataset", "member", "kind"],
+        "rows": rows,
+        "count": всего,
+        "truncated": всего > ПОТОЛОК,
+        "full_sql": format!(
+            "SELECT s.owner_category, s.owner_name, s.template, src.dataset, src.member, src.kind \
+             FROM dcs_sources src JOIN dcs_schemas s ON s.id = src.schema_id \
+             WHERE src.object_ref_key IN ({})",
+            ключи.iter().map(|к| format!("'{}'", к.replace('\'', "''"))).collect::<Vec<_>>().join(", ")
+        ),
+        "note": "kind: source — читает (таблица запроса), type — ссылочный тип, value — \
+                 значение в ЗНАЧЕНИЕ(). По текстам запросов СКД; запросы в коде модулей — \
+                 в find/grep",
+    }))
 }
 
 /// Метод в индексе: id, имя, модуль, строка.
