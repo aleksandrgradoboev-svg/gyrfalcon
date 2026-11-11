@@ -33,6 +33,7 @@
 /// | 4 | Р-022: расширения целиком — `extensions`, `extension_objects`; строки расширений во всех таблицах с адресом `../ext/<Имя>/…` |
 /// | 5 | MCP-06: `common_modules` — флаги контекста общих модулей для проверки `check_bsl` |
 /// | 6 | `calls.line` заполняется: до этого столбец был в схеме, но сборка писала NULL |
+/// | 7 | MCP-04: схемы компоновки данных — `dcs_schemas`, `dcs_datasets`, `dcs_sources`, `dcs_fields`, `dcs_parameters`, `dcs_variants` |
 ///
 /// Версия 3 совместима со 2 по чтению: столбцов не убавилось, а новый
 /// индекс лишь ускоряет. Поэтому `MIN_READABLE_SCHEMA` не поднят —
@@ -51,7 +52,11 @@
 /// `calls.line` теперь заполнен. В индексе версии 5 строки мест вызова пусты
 /// (и после инкремента пусты везде, кроме обновлённых модулей); по
 /// `schema_version` это видно, лечится пересборкой.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// Версия 7 совместима с 6 по чтению: таблицы только добавлены. На индексе
+/// версии 6 раздела СКД в карточке нет, и карточка говорит об этом, а не
+/// отвечает пустым списком, неотличимым от «у отчёта нет схемы».
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Минимальная версия схемы, которую умеет читать этот код.
 ///
@@ -523,6 +528,70 @@ CREATE TABLE IF NOT EXISTS form_elements (
     extra_json TEXT NOT NULL DEFAULT '',
     file TEXT NOT NULL
 );
+"#;
+
+/// Схемы компоновки данных (MCP-04). Связь — по `schema_id`, адрес — `file`.
+pub const SCHEMA_DCS: &str = r#"
+CREATE TABLE IF NOT EXISTS dcs_schemas (
+    id INTEGER PRIMARY KEY,
+    owner_category TEXT NOT NULL,
+    owner_name TEXT NOT NULL,
+    template TEXT NOT NULL,
+    is_main INTEGER NOT NULL DEFAULT 0,
+    file TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dcs_datasets (
+    id INTEGER PRIMARY KEY,
+    schema_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    parent TEXT NOT NULL DEFAULT '',
+    object_name TEXT NOT NULL DEFAULT '',
+    query TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS dcs_sources (
+    schema_id INTEGER NOT NULL,
+    dataset TEXT NOT NULL,
+    object_ref TEXT NOT NULL,
+    object_ref_key TEXT NOT NULL,
+    member TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dcs_fields (
+    schema_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    dataset TEXT NOT NULL DEFAULT '',
+    data_path TEXT NOT NULL,
+    field TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    expression TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS dcs_parameters (
+    schema_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    expression TEXT NOT NULL DEFAULT '',
+    use TEXT NOT NULL DEFAULT '',
+    value_type TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS dcs_variants (
+    schema_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    presentation TEXT NOT NULL DEFAULT ''
+);
+"#;
+
+/// Индексы таблиц СКД. `object_ref_key` — понижен Rust при сборке: `NOCASE`
+/// кириллицу не понижает.
+pub const INDEXES_DCS: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_dcs_owner ON dcs_schemas(owner_name);
+CREATE INDEX IF NOT EXISTS idx_dcs_ds ON dcs_datasets(schema_id);
+CREATE INDEX IF NOT EXISTS idx_dcs_src_ref ON dcs_sources(object_ref_key);
+CREATE INDEX IF NOT EXISTS idx_dcs_src_schema ON dcs_sources(schema_id);
+CREATE INDEX IF NOT EXISTS idx_dcs_fields ON dcs_fields(schema_id);
+CREATE INDEX IF NOT EXISTS idx_dcs_params ON dcs_parameters(schema_id);
+CREATE INDEX IF NOT EXISTS idx_dcs_variants ON dcs_variants(schema_id);
 "#;
 
 /// Индексы таблицы форм.

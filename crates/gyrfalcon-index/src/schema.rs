@@ -220,12 +220,55 @@ pub const TABLES: &[Table] = &[
 /// описи для него не существует — спросить её через `sql` он не догадается.
 /// `reference_rows` здесь — замер на БП (сборка 13.10.2026), а не на
 /// индексе предшественника.
-pub const OWN_TABLES: &[Table] = &[Table {
-    name: "common_modules",
-    purpose: "флаги общих модулей: клиент, сервер, вызов сервера, глобальный",
-    reference_rows: 3_437,
-    implemented: true,
-}];
+pub const OWN_TABLES: &[Table] = &[
+    Table {
+        name: "common_modules",
+        purpose: "флаги общих модулей: клиент, сервер, вызов сервера, глобальный",
+        reference_rows: 3_437,
+        implemented: true,
+    },
+    // СКД (MCP-04): связь таблиц — `schema_id` = `dcs_schemas.id`.
+    Table {
+        name: "dcs_schemas",
+        purpose:
+            "схемы компоновки данных: владелец (категория, имя), макет, основная ли схема отчёта",
+        reference_rows: 0,
+        implemented: true,
+    },
+    Table {
+        name: "dcs_datasets",
+        purpose:
+            "наборы данных СКД: вид (Query/Object/Union), родитель в объединении, ТЕКСТ ЗАПРОСА",
+        reference_rows: 0,
+        implemented: true,
+    },
+    Table {
+        name: "dcs_sources",
+        purpose:
+            "что читает набор СКД: объект (object_ref, ключ object_ref_key в нижнем регистре), \
+                  виртуальная таблица/ТЧ (member), вид source/type/value",
+        reference_rows: 0,
+        implemented: true,
+    },
+    Table {
+        name: "dcs_fields",
+        purpose: "поля СКД: kind field/calculated/total, путь, заголовок, выражение, роль",
+        reference_rows: 0,
+        implemented: true,
+    },
+    Table {
+        name: "dcs_parameters",
+        purpose: "параметры СКД: имя, заголовок, выражение, use, тип значения",
+        reference_rows: 0,
+        implemented: true,
+    },
+    Table {
+        name: "dcs_variants",
+        purpose: "варианты настроек СКД: имя и представление",
+        reference_rows: 0,
+        implemented: true,
+    },
+];
 
 /// Сколько таблиц уже реализовано.
 pub fn implemented_count() -> usize {

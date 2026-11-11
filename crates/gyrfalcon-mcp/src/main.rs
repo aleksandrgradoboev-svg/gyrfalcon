@@ -1028,6 +1028,15 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         "  элем. форм    {:>9}  (форм разобрано: {})",
         r.form_elements, r.forms
     );
+    println!(
+        "  схемы СКД     {:>9}{}",
+        r.dcs_schemas,
+        if r.dcs_unreadable > 0 {
+            format!("  (НЕ РАЗОБРАНО: {})", r.dcs_unreadable)
+        } else {
+            String::new()
+        }
+    );
     if r.extensions > 0 {
         // Расширений может не быть вовсе (на БП их нет) — тогда строки нет,
         // а не ноль: ноль перехватов и отсутствие расширений это разные факты.
