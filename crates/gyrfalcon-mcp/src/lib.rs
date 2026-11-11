@@ -19,6 +19,7 @@ pub mod kb_1c;
 pub mod mcp_http;
 pub mod platform_help;
 pub mod practice_ast;
+pub mod practice_code;
 pub mod practice_mining;
 pub mod project_practices;
 pub mod proto;

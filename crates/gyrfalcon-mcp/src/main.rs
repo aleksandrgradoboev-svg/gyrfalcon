@@ -92,6 +92,7 @@ fn print_help() {
 Команды:
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
                       [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
+                      [--experimental] экспериментальные инструменты (practice_candidates)
                       [--semantic-cache-mb 1536]
                                        держать векторы смыслового поиска в памяти
                                        (потолок на все индексы; 0 — читать с диска каждый раз)
@@ -118,6 +119,9 @@ fn print_help() {
                       вручную добавить правило из JSON; MCP выдаст его только после проверки
   practices discover --db <индекс> --project <имя> [--depth quick|full]
                       явно дополнить существующий профиль кандидатами из BSL-модулей
+  practices mine-code --db <индекс> [--out <файл.json>]
+                      ЭКСПЕРИМЕНТАЛЬНО: кандидаты практик «Конструкции кода» по всей
+                      конфигурации; файл рядом с индексом читает practice_candidates
   practices preview --db <индекс> --project <имя> [--depth quick|full] [--out <report.json>]
                       проверить полный корпус и кандидатов без изменения профиля
   practices accept --db <индекс> --project <имя> --id <id> --sample <N> --matches <N>
@@ -195,6 +199,20 @@ fn cmd_practices(args: &[String]) -> Result<(), String> {
         Some(_) => return Err("--depth: допустимо quick или full".into()),
     };
     match action {
+        "mine-code" => {
+            let db = db.ok_or("practices mine-code требует --db")?;
+            let (path, summary) = gyrfalcon_mcp::practice_code::mine_to_file(
+                std::path::Path::new(&db),
+                out.as_deref().map(std::path::Path::new),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "out": path.display().to_string(), "summary": summary
+                }))
+                .map_err(|e| e.to_string())?
+            );
+        }
         "import" => {
             let src = src.ok_or("нужен --src")?;
             let project = project.ok_or("нужен --project")?;
@@ -649,6 +667,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("неизвестный профиль '{v}': all | analysis | scout"))?;
             }
             "--auto-update" => auto_update = true,
+            "--experimental" => tools::enable_experimental(),
             "--http" => http = true,
             "--port" => {
                 i += 1;

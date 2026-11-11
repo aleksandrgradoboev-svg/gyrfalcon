@@ -456,9 +456,56 @@ fn schema_sql() -> Value {
     )
 }
 
+/// Экспериментальные инструменты: видны только серверу, запущенному с
+/// `--experimental`, и только профилям `all` и `analysis`.
+///
+/// Отдельным списком, а не в `TOOLS`: в роли, скилл и запреты Kilo
+/// попадает только устоявшийся набор. Инструмент, чей ответ — кандидат с
+/// измеренной, но неполной точностью, не должен приходить к агенту по
+/// умолчанию: агент читает ответ инструмента как факт.
+pub const EXPERIMENTAL_TOOLS: &[Tool] = &[Tool {
+    name: "practice_candidates",
+    description: "ЭКСПЕРИМЕНТАЛЬНО. Кандидаты практик проекта из типового кода, направление \
+         «Конструкции кода»: присваивания, которых избегают в обработчике или виде модуля \
+         (K1: Отказ = Ложь в ПередЗаписью и т.п.), и операторы грамматики, которых избегают \
+         (K2: Перейти). Это частота в коде, а не норма — каждую строку сверять со \
+         standards_1c и решать человеку. В ответе — точность направления по экзамену и \
+         признак outdated (индекс пересобран после добычи). Пусто «добыча не запускалась» не значит «практик нет».",
+    schema: crate::practice_code::schema,
+}];
+
+static EXPERIMENTAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Включить экспериментальные инструменты — один раз, при запуске сервера.
+pub fn enable_experimental() {
+    EXPERIMENTAL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn experimental_on() -> bool {
+    EXPERIMENTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Виден ли экспериментальный инструмент профилю при данном флаге.
+fn experimental_allows(profile: Profile, name: &str, on: bool) -> bool {
+    on && matches!(profile, Profile::All | Profile::Analysis)
+        && EXPERIMENTAL_TOOLS.iter().any(|t| t.name == name)
+}
+
+fn list_with(profile: Profile, on: bool) -> Vec<&'static Tool> {
+    TOOLS
+        .iter()
+        .filter(|t| profile.allows(t.name))
+        .chain(
+            EXPERIMENTAL_TOOLS
+                .iter()
+                .filter(|t| experimental_allows(profile, t.name, on)),
+        )
+        .collect()
+}
+
 /// Перечень инструментов, видимых профилю.
 pub fn list(profile: Profile) -> Vec<&'static Tool> {
-    TOOLS.iter().filter(|t| profile.allows(t.name)).collect()
+    list_with(profile, experimental_on())
 }
 
 /// Выполнить инструмент. `Err` — текст для агента, а не паника.
@@ -468,6 +515,18 @@ pub fn call(
     name: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    if EXPERIMENTAL_TOOLS.iter().any(|t| t.name == name) {
+        if !experimental_allows(profile, name, experimental_on()) {
+            return Err(format!(
+                "инструмент '{name}' экспериментальный: он доступен серверу, запущенному \
+                 с --experimental, в профиле all или analysis — см. tools/list"
+            ));
+        }
+        return match name {
+            "practice_candidates" => crate::practice_code::candidates(conn, args),
+            _ => Err(format!("нет такого инструмента: {name}")),
+        };
+    }
     if !profile.allows(name) {
         return Err(format!(
             "инструмент '{name}' недоступен в профиле {profile:?} — см. tools/list"
@@ -3733,8 +3792,25 @@ mod tests {
     }
 
     #[test]
+    fn экспериментальные_только_с_флагом() {
+        let имя = |v: Vec<&Tool>| v.iter().any(|t| t.name == "practice_candidates");
+        assert!(!имя(list_with(Profile::All, false)), "без флага не виден");
+        assert!(имя(list_with(Profile::All, true)));
+        assert!(имя(list_with(Profile::Analysis, true)));
+        assert!(!имя(list_with(Profile::Scout, true)), "разведчику не нужен");
+        // Без флага — громкий отказ, а не «нет такого инструмента».
+        let c = Connection::open_in_memory().unwrap();
+        let e = call(&c, Profile::All, "practice_candidates", &json!({})).unwrap_err();
+        assert!(e.contains("--experimental"), "{e}");
+    }
+
+    #[test]
     fn имена_инструментов_уникальны() {
-        let mut n: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
+        let mut n: Vec<&str> = TOOLS
+            .iter()
+            .chain(EXPERIMENTAL_TOOLS)
+            .map(|t| t.name)
+            .collect();
         n.sort_unstable();
         let было = n.len();
         n.dedup();
