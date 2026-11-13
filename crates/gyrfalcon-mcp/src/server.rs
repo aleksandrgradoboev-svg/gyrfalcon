@@ -82,6 +82,9 @@ pub struct Server {
     авто: bool,
     /// Опрос меток пересборки запускается при первом открытом проекте.
     опрос: Once,
+    /// Пересборка по вызову (`rebuild_index`, флаг `--allow-rebuild`).
+    /// `None` — инструмента у сервера нет вовсе.
+    сборки: Option<crate::rebuild_job::Сборки>,
 }
 
 /// Всё, что сервер держит про один открытый проект.
@@ -179,7 +182,65 @@ impl Server {
             проекты: Arc::new(Mutex::new(HashMap::new())),
             авто: false,
             опрос: Once::new(),
+            сборки: None,
         }
+    }
+
+    /// Разрешить пересборку по вызову: `rebuild_index` появляется в
+    /// `tools/list` профиля `all` и запускает `<бинарь> build`.
+    pub fn с_пересборкой(mut self, бинарь: Option<PathBuf>) -> Self {
+        self.сборки = бинарь.map(crate::rebuild_job::Сборки::new);
+        self
+    }
+
+    /// Виден ли `rebuild_index`: флаг сервера и профиль `all` — это пишущая
+    /// операция, как `delete_project`.
+    fn пересборка_разрешена(&self, profile: Profile) -> bool {
+        self.сборки.is_some() && profile == Profile::All
+    }
+
+    /// `rebuild_index`: запуск или отмена полной пересборки проекта.
+    fn пересобрать(&self, profile: Profile, args: &Value) -> Result<Value, String> {
+        let сборки = match &self.сборки {
+            Some(сб) if self.пересборка_разрешена(profile) => сб,
+            _ => {
+                return Err("инструмент 'rebuild_index' выключен: он доступен серверу, \
+                     запущенному с --allow-rebuild, в профиле all — см. tools/list"
+                    .into())
+            }
+        };
+        let имя = args
+            .get("project")
+            .and_then(Value::as_str)
+            .ok_or("нужен параметр project: пересобирать без имени нечего")?;
+        if имя == "*" {
+            return Err(
+                "пересборка — по одному проекту: все разом заняли бы машину \
+                 на десятки минут"
+                    .into(),
+            );
+        }
+        let путь = self.источник.путь(Some(имя)).map_err(|e| e.to_string())?;
+        // Модели передают булево и строкой. Прочитать "true" как «не отмена»
+        // значило бы запустить сборку на минуты вместо остановки.
+        let отмена = match args.get("cancel") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => true,
+            Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => false,
+            Some(другое) => {
+                return Err(format!(
+                    "cancel: ожидается true или false, пришло {другое} — ничего не запущено"
+                ))
+            }
+        };
+        let mut ответ = if отмена {
+            сборки.отменить(&путь)?
+        } else {
+            сборки.запустить(&путь)?
+        };
+        ответ["project"] = json!(имя);
+        Ok(ответ)
     }
 
     /// Запустить опрос меток пересборки (один раз на сервер).
@@ -313,7 +374,11 @@ impl Server {
             }
             "ping" => Some(proto::ok(id, json!({}))),
             "tools/list" => {
-                let список: Vec<Value> = tools::list(self.profile)
+                let mut инструменты = tools::list(self.profile);
+                if self.пересборка_разрешена(self.profile) {
+                    инструменты.extend(tools::MAINTENANCE_TOOLS.iter());
+                }
+                let список: Vec<Value> = инструменты
                     .iter()
                     .map(|t| {
                         json!({
@@ -350,6 +415,20 @@ impl Server {
                 // индекс: ему проект не нужен и открывать ничего не надо.
                 if имя == "delete_project" {
                     let итог = self.удалить_проект(&args);
+                    return Some(match итог {
+                        Ok(v) => proto::ok(
+                            id,
+                            proto::tool_result(
+                                serde_json::to_string(&v).unwrap_or_else(|e| e.to_string()),
+                                false,
+                            ),
+                        ),
+                        Err(e) => proto::ok(id, proto::tool_result(e, true)),
+                    });
+                }
+
+                if имя == "rebuild_index" {
+                    let итог = self.пересобрать(profile, &args);
                     return Some(match итог {
                         Ok(v) => proto::ok(
                             id,
@@ -741,6 +820,14 @@ impl Server {
                             "rebuilding".into(),
                             json!(gyrfalcon_index::rebuild::отказ(&p.индекс, &м)),
                         );
+                    }
+                }
+                // Итог последней пересборки этим сервером — единственное место,
+                // где агент, запустивший `rebuild_index`, узнаёт, чем кончилось.
+                if let Some(итог) = self.сборки.as_ref().and_then(|сб| сб.итог(&p.индекс))
+                {
+                    if let Some(o) = свежесть.as_object_mut() {
+                        o.insert("last_rebuild".into(), итог);
                     }
                 }
                 json!([p.имя, p.исходники, p.модулей, p.методов, p.собран, свежесть])

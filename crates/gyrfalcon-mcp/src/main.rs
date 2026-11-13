@@ -93,6 +93,8 @@ fn print_help() {
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
                       [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
                       [--experimental] экспериментальные инструменты (practice_candidates)
+                      [--allow-rebuild] инструмент rebuild_index: агент запускает полную
+                                       пересборку индекса (только с --profile all)
                       [--semantic-cache-mb 1536]
                                        держать векторы смыслового поиска в памяти
                                        (потолок на все индексы; 0 — читать с диска каждый раз)
@@ -637,6 +639,9 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     // Выключена по умолчанию — как auto_index у образца: сборка трогает
     // файл, которым сервер отвечает, и включать её за человека нельзя.
     let mut auto_update = false;
+    // Пересборка по вызову (`rebuild_index`) — выключена по тем же причинам
+    // и сильнее: это запуск процесса на минуты всех ядер по просьбе агента.
+    let mut allow_rebuild = false;
     // Транспорт: stdio, пока не сказано иное. Порт отдельно от флага, чтобы
     // `--port` без `--http` не молчал, а был назван ошибкой.
     let mut http = false;
@@ -668,6 +673,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
             }
             "--auto-update" => auto_update = true,
             "--experimental" => tools::enable_experimental(),
+            "--allow-rebuild" => allow_rebuild = true,
             "--http" => http = true,
             "--port" => {
                 i += 1;
@@ -726,7 +732,22 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
     gyrfalcon_index::semantic::set_cache_limit(semantic_cache_mb);
-    let сервер = server::Server::new(источник, profile).с_автодосборкой(auto_update);
+    if allow_rebuild && profile != tools::Profile::All {
+        return Err(
+            "--allow-rebuild без --profile all: rebuild_index — пишущая операция, \
+             как delete_project, и выдаётся только профилю all"
+                .into(),
+        );
+    }
+    // Свой бинарь: пересборку ведёт та же версия, что и отвечает по индексу.
+    let бинарь = if allow_rebuild {
+        Some(std::env::current_exe().map_err(|e| format!("путь к своему бинарю не узнать: {e}"))?)
+    } else {
+        None
+    };
+    let сервер = server::Server::new(источник, profile)
+        .с_автодосборкой(auto_update)
+        .с_пересборкой(бинарь);
     if http {
         mcp_http::serve(
             сервер,
