@@ -104,6 +104,11 @@ pub struct Ranked {
     /// Какой сигнал внёс наибольший вклад. Не украшение: без него
     /// «почему это первое» выясняется только чтением кода.
     pub reason: &'static str,
+    /// Сколько ещё РАЗНЫХ мест (иных `payload`) с тем же видом и именем
+    /// склеено в эту строку. У метода это одноимённые методы других модулей:
+    /// строка показывает один из них, и агенту надо знать, что он не
+    /// единственный.
+    pub others: usize,
 }
 
 /// Нормировка одного сигнала по выдаче: min-max в 0..1.
@@ -139,12 +144,26 @@ pub fn rank(mut кандидаты: Vec<Candidate>, limit: usize) -> Vec<Ranked>
     }
 
     // Склейка дубликатов: берём максимум по каждому сигналу.
+    //
+    // Под одним именем бывают и разные сущности: одноимённые методы разных
+    // модулей. Тогда строка показывает место того, у кого больше связность
+    // (его вызывают — его и ищут), а не первого попавшегося. Прежде место
+    // бралось у первого, а связность — максимальная от всех: балл
+    // вызываемого метода приходил с путём невызываемого, и агент читал не тот
+    // модуль (УТ: `СообщитьПользователю` из формы вместо общего модуля с
+    // 2304 вызовами). Сколько ещё мест склеено — `others`.
     let mut индекс: HashMap<(String, String), usize> = HashMap::new();
     let mut слитые: Vec<Candidate> = Vec::with_capacity(кандидаты.len());
+    let mut степень_места: Vec<f32> = Vec::with_capacity(кандидаты.len());
+    let mut места: Vec<std::collections::HashSet<Vec<String>>> =
+        Vec::with_capacity(кандидаты.len());
     for c in кандидаты.drain(..) {
         let ключ = (c.kind.clone(), c.name.to_lowercase());
         match индекс.get(&ключ) {
             Some(&i) => {
+                if !c.payload.is_empty() {
+                    места[i].insert(c.payload.clone());
+                }
                 let s = &mut слитые[i].signals;
                 s.exact = s.exact.max(c.signals.exact);
                 s.bm25 = s.bm25.max(c.signals.bm25);
@@ -153,12 +172,22 @@ pub fn rank(mut кандидаты: Vec<Candidate>, limit: usize) -> Vec<Ranked>
                 s.synonym = s.synonym.max(c.signals.synonym);
                 s.idf = s.idf.max(c.signals.idf);
                 s.usage = s.usage.max(c.signals.usage);
-                if слитые[i].payload.is_empty() {
+                if !c.payload.is_empty()
+                    && (слитые[i].payload.is_empty()
+                        || c.signals.degree > степень_места[i])
+                {
+                    степень_места[i] = c.signals.degree;
                     слитые[i].payload = c.payload;
                 }
             }
             None => {
                 индекс.insert(ключ, слитые.len());
+                степень_места.push(c.signals.degree);
+                места.push(
+                    std::iter::once(c.payload.clone())
+                        .filter(|p| !p.is_empty())
+                        .collect(),
+                );
                 слитые.push(c);
             }
         }
@@ -206,6 +235,7 @@ pub fn rank(mut кандидаты: Vec<Candidate>, limit: usize) -> Vec<Ranked>
                 score,
                 signals: c.signals,
                 reason,
+                others: места[i].len().saturating_sub(1),
             }
         })
         .collect();
@@ -330,6 +360,29 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].signals.exact, 1.0);
         assert_eq!(r[0].signals.semantic, 0.9);
+    }
+
+    #[test]
+    fn одноимённые_места_строка_у_самого_связного_и_счётчик() {
+        // Два одноимённых метода разных модулей: место строки — у того, кого
+        // вызывают, а не у первого пришедшего; второй назван в `others`.
+        let место = |путь: &str, степень: f32| Candidate {
+            kind: "method".into(),
+            name: "Обработать".into(),
+            payload: vec!["Процедура".into(), "1".into(), путь.into(), "1".into()],
+            signals: Signals {
+                exact: 1.0,
+                degree: степень,
+                ..Default::default()
+            },
+        };
+        let r = rank(vec![место("Альфа", 0.0), место("Бета", 1.4)], 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].payload[2], "Бета");
+        assert_eq!(r[0].others, 1);
+        // Та же сущность двумя путями (одинаковое место) — не «другое место».
+        let r = rank(vec![место("Бета", 1.4), место("Бета", 0.0)], 10);
+        assert_eq!(r[0].others, 0);
     }
 
     #[test]

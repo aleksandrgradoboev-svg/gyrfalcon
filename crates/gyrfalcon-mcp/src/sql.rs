@@ -57,7 +57,50 @@ pub fn open_readonly(db: &Path) -> Result<Connection, SqlError> {
         .map_err(|e| SqlError::Sqlite(e.to_string()))?;
     c.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| SqlError::Sqlite(e.to_string()))?;
+    юникод_регистр(&c).map_err(|e| SqlError::Sqlite(e.to_string()))?;
     Ok(c)
+}
+
+/// Подменить `lower()` и `upper()` версиями, понимающими кириллицу.
+///
+/// Встроенные функции SQLite меняют регистр только у ASCII:
+/// `lower('ЦеныНоменклатуры')` возвращает строку как есть. Отсюда два тихих
+/// промаха, оба без ошибки:
+///
+/// - запрос агента `lower(name) LIKE '%обеспечен%'` (так модель пишет в
+///   `sql`, прогон 11) не находил ни одного русского имени;
+/// - `find` сравнивал `callee_key` (понижен Rust при сборке) с
+///   `lower(m.name)` — у русских имён методов совпадения не было, и сигнал
+///   связности по графу был нулём (`СообщитьПользователю` в УТ: 2304
+///   вызова, засчитано 0).
+///
+/// Подменяются функции, а не `NOCASE`: в схеме индекса `lower(` не
+/// встречается, поэтому порядок индексов от подмены не зависит (подмена
+/// сравнения `NOCASE` сделала бы его неверным молча). Живёт подмена только в
+/// соединениях сервера; файл индекса и внешние клиенты SQLite её не видят.
+fn юникод_регистр(c: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::{Context, FunctionFlags};
+    use rusqlite::types::{Value as V, ValueRef};
+    let флаги = FunctionFlags::SQLITE_UTF8
+        | FunctionFlags::SQLITE_DETERMINISTIC
+        | FunctionFlags::SQLITE_INNOCUOUS;
+    // Как у встроенных: NULL остаётся NULL, число и текст — текстом.
+    fn сменить(ctx: &Context<'_>, f: fn(&str) -> String) -> rusqlite::Result<V> {
+        Ok(match ctx.get_raw(0) {
+            ValueRef::Null => V::Null,
+            ValueRef::Integer(i) => V::Text(i.to_string()),
+            ValueRef::Real(r) => V::Text(r.to_string()),
+            ValueRef::Text(t) => V::Text(f(&String::from_utf8_lossy(t))),
+            ValueRef::Blob(b) => V::Text(f(&String::from_utf8_lossy(b))),
+        })
+    }
+    c.create_scalar_function("lower", 1, флаги, |ctx| {
+        сменить(ctx, str::to_lowercase)
+    })?;
+    c.create_scalar_function("upper", 1, флаги, |ctx| {
+        сменить(ctx, str::to_uppercase)
+    })?;
+    Ok(())
 }
 
 /// Ключевые слова, которых не должно быть в read-only запросе.
@@ -584,5 +627,63 @@ mod tests {
             ro.execute_batch("INSERT INTO t VALUES (2)").is_err(),
             "запись обязана падать на уровне соединения, а не разбора"
         );
+    }
+
+    #[test]
+    fn lower_и_upper_понимают_кириллицу() {
+        let dir = std::env::temp_dir().join(format!("gyrfalcon-sql-lower-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE modules (id INTEGER, rel_path TEXT);
+                 CREATE TABLE methods (module_id INTEGER, name TEXT);
+                 CREATE TABLE calls (callee_key TEXT);
+                 INSERT INTO modules VALUES (1, 'CommonModules/Мод/Ext/Module.bsl');
+                 INSERT INTO methods VALUES (1, 'СообщитьПользователю');
+                 INSERT INTO calls VALUES ('CommonModules/Мод/Ext/Module.bsl::сообщитьпользователю');
+                 INSERT INTO calls VALUES ('CommonModules/Мод/Ext/Module.bsl::сообщитьпользователю');",
+            )
+            .unwrap();
+            // Встроенная — только ASCII: ровно то, что подменяется.
+            let было: String = c
+                .query_row("SELECT lower('ЦеныНоменклатуры')", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(было, "ЦеныНоменклатуры");
+        }
+        let ro = open_readonly(&db).unwrap();
+        let v = run(
+            &ro,
+            "SELECT lower('ЦеныНоменклатуры'), upper('ценыNom'), lower(NULL), lower(42)",
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            v["rows"][0],
+            json!(["ценыноменклатуры", "ЦЕНЫNOM", null, "42"])
+        );
+        // Как пишет запросы модель: lower(...) LIKE по русской подстроке.
+        let v = run(
+            &ro,
+            "SELECT name FROM methods WHERE lower(name) LIKE '%пользовател%'",
+            10,
+        )
+        .unwrap();
+        assert_eq!(v["returned"], 1, "{v}");
+        // Связность в `find`: ключ из Rust против lower() в SQL.
+        let deg: i64 = ro
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM calls c
+                          WHERE c.callee_key = mo.rel_path || '::' || lower(m.name))
+                 FROM methods m JOIN modules mo ON mo.id = m.module_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deg, 2, "вызовы русского метода должны засчитываться");
+        drop(ro);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
