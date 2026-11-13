@@ -134,10 +134,45 @@ pub(crate) struct ModuleData {
 /// он строится ОДИН раз по всем конфигурациям и переносится между ними,
 /// поэтому берётся снаружи, а не пересчитывается на каждую сборку.
 /// `None` — словаря нет, семантика уйдёт целиком в random indexing.
+///
+/// Пишется не в `out`, а рядом (`<out>.new`), и подменяет `out` в конце
+/// одним `rename` — так полная пересборка проходит под работающим сервером,
+/// который на время сборки индекс не отдаёт и файл отпускает (MCP-07 п. 11,
+/// [`crate::rebuild`]). Неудачная сборка оставляет `out` нетронутым.
 pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport> {
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let метка = crate::rebuild::Метка::поставить(
+        out,
+        crate::rebuild::прошлая_длительность(out),
+    )
+    .map_err(|e| IndexError::Unsupported(e.to_string()))?;
+    let собранный = crate::rebuild::путь_сборки(out);
+    let report = match собрать(src, &собранный, out, dict) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&собранный);
+            return Err(e);
+        }
+    };
+    crate::rebuild::подменить(&собранный, out, crate::rebuild::ЖДАТЬ_ПОДМЕНЫ)
+        .map_err(|e| IndexError::Unsupported(e.to_string()))?;
+    drop(метка);
+    Ok(report)
+}
+
+/// Собрать индекс в файл `out`. `прежний` — индекс, который заменяется:
+/// из него берутся проектная справка и её дополнительные источники.
+fn собрать(
+    src: &Path,
+    out: &Path,
+    прежний: &Path,
+    dict: Option<&Path>,
+) -> Result<BuildReport> {
     let started = Instant::now();
     let mut report = BuildReport::default();
-    let old_help = help::snapshot(out).map_err(IndexError::Unsupported)?;
+    let old_help = help::snapshot(прежний).map_err(IndexError::Unsupported)?;
     if let Some(previous) = old_help.primary_root() {
         let canonical = src.canonicalize()?;
         if Path::new(previous) != canonical {
@@ -182,10 +217,12 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     report.files_with_parse_errors = parsed.iter().filter(|m| m.parsed.has_errors).count() as u64;
 
     // --- запись модулей, методов, областей ---
-    if let Some(dir) = out.parent() {
-        std::fs::create_dir_all(dir)?;
+    // Остаток прошлой неудачной подмены. Ошибка удаления — ошибка сборки:
+    // молча продолжить значило бы дописывать в чужой файл (так было с живым
+    // индексом до MCP-07 п. 11).
+    if out.exists() {
+        std::fs::remove_file(out)?;
     }
-    let _ = std::fs::remove_file(out);
     let mut conn = Connection::open(out)?;
     conn.execute_batch(ddl::BUILD_PRAGMAS)?;
     conn.execute_batch(ddl::SCHEMA)?;
@@ -307,6 +344,12 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     report.index_ms = t.elapsed().as_millis() as u64;
 
     write_meta(&conn, src, &report)?;
+    // Длительность — для отказа следующей пересборки «ждать ещё около N с».
+    // Отдельно от `write_meta`: `report.total_ms` к этому месту ещё не известен.
+    conn.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('build_ms', ?1)",
+        rusqlite::params![started.elapsed().as_millis().to_string()],
+    )?;
     conn.execute_batch("PRAGMA optimize;")?;
 
     report.total_ms = started.elapsed().as_millis() as u64;

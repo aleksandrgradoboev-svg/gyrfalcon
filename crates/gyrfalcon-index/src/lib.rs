@@ -58,6 +58,7 @@ pub mod integration;
 pub mod meta;
 pub mod meta2;
 pub mod rank;
+pub mod rebuild;
 pub mod refs;
 pub mod resolve;
 pub mod schema;
