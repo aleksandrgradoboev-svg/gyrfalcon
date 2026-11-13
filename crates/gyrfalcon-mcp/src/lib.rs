@@ -23,6 +23,7 @@ pub mod practice_code;
 pub mod practice_mining;
 pub mod project_practices;
 pub mod proto;
+pub mod rebuild_job;
 pub mod registry;
 pub mod server;
 pub mod sql;

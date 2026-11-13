@@ -477,6 +477,46 @@ pub const EXPERIMENTAL_TOOLS: &[Tool] = &[Tool {
     schema: crate::practice_code::schema,
 }];
 
+/// Инструменты обслуживания: видны только серверу, запущенному с
+/// `--allow-rebuild`, и только профилю `all` (MCP-04).
+///
+/// Отдельным списком, как и экспериментальные: это первый инструмент, который
+/// ПИШЕТ (запускает сборку, нагружает все ядра на минуты), и по умолчанию
+/// его у сервера нет — в том числе у сервера в контейнере, открытого наружу.
+/// Флаг — поле сервера, а не глобальный переключатель: так его видят тесты
+/// одного сервера и не видят соседние.
+pub const MAINTENANCE_TOOLS: &[Tool] = &[Tool {
+    name: "rebuild_index",
+    description: "Полностью пересобрать индекс проекта по его исходникам — отдельным \
+         процессом, без остановки сервера. Отвечает сразу («запущено»), а не по окончании: \
+         ход и ожидаемое время — поле rebuilding в list_projects, итог последней пересборки \
+         (успех или ошибка, длительность, хвост журнала) — поле last_rebuild там же. На \
+         время сборки вызовы по этому проекту получают отказ «пересобирается». cancel: true \
+         останавливает сборку, запущенную этим сервером; живой индекс при этом цел. Нужна, \
+         когда индекс неполон известным образом: новая версия сервера, правка метаданных \
+         (.xml) — их автодосборка не берёт.",
+    schema: schema_rebuild_index,
+}];
+
+fn schema_rebuild_index() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Проект из list_projects. Один, явно: пересборка всех разом \
+                    положила бы машину на десятки минут."
+            },
+            "cancel": {
+                "type": "boolean",
+                "description": "true — остановить идущую пересборку этого проекта, \
+                    запущенную этим сервером."
+            }
+        },
+        "required": ["project"]
+    })
+}
+
 static EXPERIMENTAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Включить экспериментальные инструменты — один раз, при запуске сервера.
@@ -3952,6 +3992,7 @@ mod tests {
         let mut n: Vec<&str> = TOOLS
             .iter()
             .chain(EXPERIMENTAL_TOOLS)
+            .chain(MAINTENANCE_TOOLS)
             .map(|t| t.name)
             .collect();
         n.sort_unstable();
@@ -3962,7 +4003,7 @@ mod tests {
 
     #[test]
     fn у_каждого_инструмента_есть_схема_и_описание() {
-        for t in TOOLS {
+        for t in TOOLS.iter().chain(MAINTENANCE_TOOLS) {
             let s = (t.schema)();
             assert_eq!(s["type"], "object", "{}: схема не объект", t.name);
             assert!(
