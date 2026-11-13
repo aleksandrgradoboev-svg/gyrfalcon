@@ -254,6 +254,9 @@ pub fn run(conn: &Connection, sql: &str, limit: usize) -> Result<Value, SqlError
 /// не значится и само выпадает. Лишняя таблица (слово совпало с именем
 /// таблицы случайно) стоит строки в ошибке; пропущенная — ещё одного круга.
 fn с_подсказкой(conn: &Connection, запрос: &str, ошибка: String) -> String {
+    if ошибка.contains("no such table") {
+        return с_таблицами(conn, ошибка);
+    }
     if !ошибка.contains("no such column") {
         return ошибка;
     }
@@ -272,13 +275,10 @@ fn с_подсказкой(conn: &Connection, запрос: &str, ошибка: 
             })
             .unwrap_or_default()
     };
-    let таблицы: Vec<String> = имена(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name",
-        &[],
-    )
-    .into_iter()
-    .filter(|t| слова.contains(&t.to_lowercase()))
-    .collect();
+    let таблицы: Vec<String> = таблицы_индекса(conn)
+        .into_iter()
+        .filter(|t| слова.contains(&t.to_lowercase()))
+        .collect();
     if таблицы.is_empty() {
         return format!(
             "{ошибка}. Таблицы индекса в запросе не распознаны — их столбцы покажет инструмент schema"
@@ -295,6 +295,79 @@ fn с_подсказкой(conn: &Connection, запрос: &str, ошибка: 
         "{ошибка}. Настоящие столбцы таблиц запроса: {}",
         описи.join("; ")
     )
+}
+
+/// Дописать к «no such table» таблицы индекса — сначала похожие на промах.
+///
+/// Тот же круг, что у столбцов: на пробе 11.11.2026 модель написала
+/// `FROM movements` по имени инструмента, а таблица — `register_movements`.
+/// Похожие — те, чьё имя содержит промах или (от четырёх знаков) содержится
+/// в нём, без учёта регистра; они идут первыми, чтобы исправление читалось
+/// сразу. Служебные таблицы SQLite и теневые таблицы полнотекстового поиска не
+/// перечисляются: запрос к ним агенту не нужен, а список они удлиняют.
+fn с_таблицами(conn: &Connection, ошибка: String) -> String {
+    let промах = ошибка
+        .split("no such table:")
+        .nth(1)
+        .map(|s| {
+            s.trim()
+                .trim_matches(|c| c == '"' || c == '`')
+                .to_lowercase()
+        })
+        .unwrap_or_default();
+    // Имя может прийти со схемой (`main.x`) — сравнивается последняя часть.
+    let промах = промах.rsplit('.').next().unwrap_or_default().to_string();
+    let все = таблицы_индекса(conn);
+    if все.is_empty() {
+        return ошибка;
+    }
+    let похож = |t: &str| {
+        let t = t.to_lowercase();
+        // Обратное вхождение — только для имён от четырёх знаков: иначе
+        // короткое имя вроде `t` «похоже» на любой промах, где есть эта буква.
+        !промах.is_empty()
+            && (t.contains(&промах) || (t.chars().count() >= 4 && промах.contains(&t)))
+    };
+    let похожие: Vec<&str> = все
+        .iter()
+        .map(String::as_str)
+        .filter(|t| похож(t))
+        .collect();
+    let начало = if похожие.is_empty() {
+        String::new()
+    } else {
+        format!(" Похожие: {}.", похожие.join(", "))
+    };
+    format!(
+        "{ошибка}.{начало} Таблицы индекса: {} — столбцы покажет инструмент schema",
+        все.join(", ")
+    )
+}
+
+/// Таблицы и представления индекса — без служебных SQLite и теневых FTS.
+/// Сбой чтения схемы даёт пустой список: подсказка — добавка к ошибке, а не
+/// новая ошибка.
+fn таблицы_индекса(conn: &Connection) -> Vec<String> {
+    conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') \
+         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name",
+    )
+    .and_then(|mut st| {
+        st.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|t| !теневая_fts(t))
+    .collect()
+}
+
+/// Теневая таблица FTS5 (`<имя>_fts_data`, `_idx`, `_content`, `_docsize`,
+/// `_config`) — внутреннее устройство поиска, не данные.
+fn теневая_fts(t: &str) -> bool {
+    ["_data", "_idx", "_content", "_docsize", "_config"]
+        .iter()
+        .any(|суф| t.ends_with(суф) && t.contains("_fts"))
 }
 
 fn значение(r: &rusqlite::Row<'_>, i: usize) -> Value {
@@ -430,6 +503,46 @@ mod tests {
             Err(SqlError::Sqlite(s)) => {
                 assert!(s.contains("t(a, b)"), "{s}");
                 assert!(!s.contains("u("), "лишняя таблица: {s}");
+            }
+            other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn нет_таблицы_ошибка_называет_таблицы_и_похожие_первыми() {
+        let c = база();
+        c.execute_batch(
+            "CREATE TABLE register_movements (doc TEXT, reg TEXT);
+             CREATE VIRTUAL TABLE methods_fts USING fts5(name);",
+        )
+        .unwrap();
+        // Промах пробы 11.11: имя инструмента вместо имени таблицы.
+        match run(&c, "SELECT * FROM movements", 10) {
+            Err(SqlError::Sqlite(s)) => {
+                assert!(s.contains("no such table"), "{s}");
+                assert!(s.contains("Похожие: register_movements."), "{s}");
+                // Перечень — между «Таблицы индекса:» и « — », через запятую.
+                let перечень: Vec<&str> = s
+                    .split("Таблицы индекса:")
+                    .nth(1)
+                    .and_then(|x| x.split(" — ").next())
+                    .expect("перечень таблиц")
+                    .split(',')
+                    .map(str::trim)
+                    .collect();
+                assert_eq!(
+                    перечень,
+                    ["methods_fts", "register_movements", "t"],
+                    "все таблицы, без теневых FTS и служебных SQLite: {s}"
+                );
+            }
+            other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
+        }
+        // Похожих нет — список всё равно есть, без раздела «Похожие».
+        match run(&c, "SELECT * FROM совсем_другое", 10) {
+            Err(SqlError::Sqlite(s)) => {
+                assert!(!s.contains("Похожие"), "{s}");
+                assert!(s.contains("register_movements"), "{s}");
             }
             other => panic!("ожидалась ошибка SQLite, получено {other:?}"),
         }

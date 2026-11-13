@@ -13,6 +13,20 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
+# Ярлык читается у GitHub во время прогона, а не из снимка события (ниже),
+# поэтому прав нужно чуть больше умолчания — только на чтение PR.
+permissions:
+  contents: read
+  pull-requests: read
+
+# Новый прогон по тому же PR отменяет недоигранный старый. PR, открытый через
+# API, получает ярлык вторым запросом через секунду: прогон от `opened` иначе
+# доходил до конца без ярлыка и оставлял красную отметку рядом с зелёной от
+# `labeled` (#18, #33). Отменённый прогон — серый, не красный.
+concurrency:
+  group: version-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   bump:
     name: версия поднята
@@ -25,7 +39,9 @@ jobs:
       - name: Сверить версию с main
         env:
           BASE: ${{ github.base_ref }}
-          SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'no-version-bump') }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           set -euo pipefail
           git fetch --quiet --tags origin "$BASE"
@@ -41,7 +57,16 @@ jobs:
             echo "Код не менялся — версия не обязана расти."
             exit 0
           fi
-          if [ "$SKIP" = "true" ]; then
+          # Ярлыки — на момент прогона. Снимок события (`github.event…labels`)
+          # фиксируется при событии: прогон от `opened` видел PR без ярлыка,
+          # поставленного секундой позже, и перезапуск видел тот же снимок.
+          # Сбой API — не повод краснеть: тогда берётся снимок события, как раньше.
+          if ! labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name'); then
+            echo "::warning::Ярлыки PR не прочитаны через API — беру снимок события."
+            labels=$(printf '%s' "$EVENT_LABELS" | tr ',' '\n')
+          fi
+          echo "Ярлыки PR: ${labels:-нет}"
+          if printf '%s\n' "$labels" | grep -qx 'no-version-bump'; then
             echo "::notice::Ярлык no-version-bump: проверка пропущена по решению автора PR."
             exit 0
           fi
