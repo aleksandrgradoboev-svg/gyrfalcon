@@ -1072,6 +1072,18 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
         }
     }
 
+    // Строка метода — по ВСЕМ одноимённым методам индекса, а не по попавшим в
+    // выборку: выборку режет `LIMIT`, и на запросе по префиксу из десятка
+    // одноимённых в неё попадал один — `others: 0` читался как «единственный».
+    // Место — у самого вызываемого; запрос на строку по индексу имени, строк
+    // не больше `limit`.
+    for r in ранжированные.iter_mut().filter(|r| r.kind == "method") {
+        if let Some((место, всего)) = одноимённые_методы(conn, &r.name) {
+            r.payload = место;
+            r.others = всего.saturating_sub(1);
+        }
+    }
+
     let rows: Vec<Value> = ранжированные
         .iter()
         .map(|r| {
@@ -1082,14 +1094,18 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
                 // печатается как 0.949999988079071 — двоичный хвост f32.
                 ((r.score as f64) * 1000.0).round() / 1000.0,
                 r.reason,
-                r.payload
+                r.payload,
+                r.others
             ])
         })
         .collect();
 
     let mut out = json!({
         "query": q,
-        "columns": ["name", "kind", "score", "reason", "details"],
+        // `others` — сколько ещё мест с тем же видом и именем склеено в строку
+        // (одноимённые методы других модулей). `details` — место самого
+        // вызываемого из них; остальные — `callers`/`read` с `module` или `sql`.
+        "columns": ["name", "kind", "score", "reason", "details", "others"],
         "rows": rows,
         "found": ранжированные.len(),
     });
@@ -1097,6 +1113,42 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["semantic_error"] = json!(e);
     }
     Ok(out)
+}
+
+/// Самое вызываемое место метода с этим именем и сколько всего таких методов.
+///
+/// Место в той же форме, что `details` строки метода в `find`: тип, экспорт,
+/// модуль, строка. Связность — тем же сравнением ключа, что в выборке `find`
+/// (`lower()` с кириллицей — `sql::open_readonly`). При равной связности —
+/// экспортный, затем короче путь: общий модуль полезнее формы.
+fn одноимённые_методы(
+    conn: &Connection,
+    имя: &str,
+) -> Option<(Vec<String>, usize)> {
+    let mut st = conn
+        .prepare(
+            "SELECT m.type, m.is_export, mo.rel_path, m.line,
+                    (SELECT COUNT(*) FROM calls c
+                      WHERE c.callee_key = mo.rel_path || '::' || lower(m.name)) AS deg,
+                    COUNT(*) OVER () AS всего
+             FROM methods m JOIN modules mo ON mo.id = m.module_id
+             WHERE m.name = ?1 COLLATE NOCASE
+             ORDER BY deg DESC, m.is_export DESC, length(mo.rel_path), mo.rel_path
+             LIMIT 1",
+        )
+        .ok()?;
+    st.query_row([имя], |r| {
+        Ok((
+            vec![
+                r.get::<_, String>(0).unwrap_or_default(),
+                r.get::<_, i64>(1).unwrap_or(0).to_string(),
+                r.get::<_, String>(2).unwrap_or_default(),
+                r.get::<_, i64>(3).unwrap_or(0).to_string(),
+            ],
+            r.get::<_, i64>(5)? as usize,
+        ))
+    })
+    .ok()
 }
 
 /// Объект в реестре индекса: имена и категории всех объектов.
@@ -4019,5 +4071,75 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         let e = call(&c, Profile::Scout, "sql", &json!({"query": "SELECT 1"})).unwrap_err();
         assert!(e.contains("недоступен"), "получено: {e}");
+    }
+
+    /// Связность по графу в `find` у русских имён: вызываемый метод выше
+    /// одноимённого невызываемого. Без `lower()` с кириллицей (sql.rs) сигнал
+    /// был нулём у всех русских имён — и порядок решала очерёдность в таблице.
+    #[test]
+    fn find_поднимает_вызываемый_метод_с_русским_именем() {
+        let d = std::env::temp_dir().join(format!("gyrfalcon-find-deg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let src = d.join("src");
+        let модуль = |имя: &str, текст: &str| {
+            let м = src.join(format!("CommonModules/{имя}/Ext"));
+            std::fs::create_dir_all(&м).unwrap();
+            std::fs::write(м.join("Module.bsl"), текст).unwrap();
+        };
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("Configuration.xml"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<MetaDataObject/>",
+        )
+        .unwrap();
+        // Вызываемый — второй по порядку (Б после А): иначе тест прошёл бы
+        // и без сигнала, на одной очерёдности строк.
+        модуль("Альфа", "Процедура Обработать() Экспорт\nКонецПроцедуры\n");
+        модуль("Бета", "Процедура Обработать() Экспорт\nКонецПроцедуры\n");
+        модуль(
+            "Вызывающий",
+            "Процедура Звать()\n\tБета.Обработать();\n\tБета.Обработать();\n\tБета.Обработать();\nКонецПроцедуры\n",
+        );
+        let индекс = d.join("t.db");
+        gyrfalcon_index::build(&src, &индекс, None).unwrap();
+        let c = crate::sql::open_readonly(&индекс).unwrap();
+        let вызовов: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM calls WHERE callee_key LIKE 'CommonModules/Бета/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(вызовов, 3, "сборка обязана разрешить вызовы общего модуля");
+        let v = call(
+            &c,
+            Profile::All,
+            "find",
+            &json!({"query": "Обработать", "kind": "method", "limit": 5}),
+        )
+        .unwrap();
+        let пути: Vec<String> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r[0] == "Обработать")
+            .map(|r| r[4][2].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            пути.first().is_some_and(|p| p.contains("Бета")),
+            "вызываемый метод должен быть первым: {пути:?}\n{v}"
+        );
+        let строка = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r[0] == "Обработать")
+            .unwrap();
+        assert_eq!(
+            строка[5], 1,
+            "одноимённый метод Альфа назван счётчиком: {v}"
+        );
+        drop(c);
+        let _ = std::fs::remove_dir_all(d);
     }
 }
