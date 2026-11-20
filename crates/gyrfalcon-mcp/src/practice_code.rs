@@ -974,6 +974,11 @@ pub fn candidates(conn: &Connection, args: &Value) -> Result<Value, String> {
         ));
     }
     let mech = args.get("mech").and_then(Value::as_str);
+    if let Some(m) = mech.filter(|m| !matches!(*m, "K1" | "K2")) {
+        return Err(format!(
+            "mech {m} не из «Конструкций кода» (K1, K2); C1–C6 — это direction: \"calls\""
+        ));
+    }
     let needle = args
         .get("contains")
         .and_then(Value::as_str)

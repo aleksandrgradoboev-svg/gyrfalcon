@@ -524,6 +524,8 @@ pub struct Meth {
 pub struct Corpus {
     pub mods: HashMap<i64, Module>,
     pub meths: Vec<Meth>,
+    /// Модули индекса, не прочитанные с диска (нет файла, не UTF-8).
+    pub read_errors: usize,
 }
 
 fn opt(s: &Option<String>) -> &str {
@@ -680,11 +682,14 @@ pub fn corpus(conn: &Connection, source: &Path) -> Result<Corpus, String> {
     let mut out = Corpus {
         mods: HashMap::new(),
         meths: Vec::new(),
+        read_errors: 0,
     };
     for ((id, ..), r) in mods.iter().zip(parsed) {
         if let Some((m, recs)) = r {
             out.mods.insert(*id, m);
             out.meths.extend(recs);
+        } else {
+            out.read_errors += 1;
         }
     }
     Ok(out)
@@ -761,7 +766,6 @@ struct Syms {
     seq: Vec<Vec<u32>>,
     set: Vec<Vec<u32>>,
     mset: Vec<Vec<u32>>,
-    server: u32,
 }
 
 const SERVER_CALL: &str = "@серверный-вызов";
@@ -799,13 +803,7 @@ fn syms(c: &Corpus) -> Syms {
         set.push(u);
         mset.push(mu);
     }
-    Syms {
-        it,
-        seq,
-        set,
-        mset,
-        server,
-    }
+    Syms { it, seq, set, mset }
 }
 
 // ---------------------------------------------------------------- C1
@@ -1131,8 +1129,7 @@ fn mine_c2_c6(c: &Corpus, s: &Syms, c1: &[Value], env: &Env) -> Vec<Value> {
     let mut n_mt: HashMap<String, u64> = HashMap::new();
     let mut n_amt: HashMap<(u32, String), u64> = HashMap::new();
     let mut kmt: HashMap<String, OrdCounter> = HashMap::new();
-    for (mi, m) in c.meths.iter().enumerate() {
-        let (dr, ks) = &ctxs[mi];
+    for (mi, (dr, ks)) in ctxs.iter().enumerate() {
         let mt = &ks[1];
         *n_mt.entry(mt.clone()).or_default() += 1;
         for k in ks {
@@ -1155,7 +1152,6 @@ fn mine_c2_c6(c: &Corpus, s: &Syms, c1: &[Value], env: &Env) -> Vec<Value> {
             }
         }
         if let Some(&f) = s.seq[mi].first() {
-            let _ = m;
             for k in ks {
                 *first_ak.entry((f, k.clone())).or_default() += 1;
             }
@@ -1716,7 +1712,6 @@ fn mine_c2_c6(c: &Corpus, s: &Syms, c1: &[Value], env: &Env) -> Vec<Value> {
         "unused": unused, "of": notcalled}));
     out.push(json!({"mech": "C5-export-self-only", "share": pyround(exp_self as f64 / exp_total.max(1) as f64, 3),
         "self_only": exp_self, "of": exp_total}));
-    let _ = s.server;
     out
 }
 
@@ -2197,6 +2192,7 @@ pub struct Mined {
     pub methods: usize,
     pub events: usize,
     pub modules: usize,
+    pub read_errors: usize,
     pub c1: Vec<Value>,
     pub c2: Vec<Value>,
     pub ranked: Ranked,
@@ -2219,6 +2215,7 @@ pub fn mine(
         methods: c.meths.len(),
         events: c.meths.iter().map(|m| m.ev.len()).sum(),
         modules: c.mods.len(),
+        read_errors: c.read_errors,
         c1,
         c2,
         ranked,
@@ -2264,6 +2261,9 @@ pub fn mine_to_file(
     }
     let summary = json!({
         "modules": m.modules,
+        // модули из индекса, не прочитанные с диска (нет файла, не UTF-8):
+        // их методы в добычу не попали
+        "read_errors": m.read_errors,
         "methods": m.methods,
         "events": m.events,
         "findings": by_mech,
@@ -2291,8 +2291,9 @@ pub fn mine_to_file(
         "index_built_at": meta(&conn, "built_at"),
         "source_path": source,
         "summary": summary,
+        // Только семейства: все находки (`members`, на БП — 90 тыс.) инструменту
+        // не нужны, а файл он разбирает на каждом вызове. Они — в --dump.
         "families": m.ranked.families,
-        "members": m.ranked.members,
     });
     let path = out.map(Path::to_path_buf).unwrap_or_else(|| sidecar(db));
     let text = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
@@ -2331,6 +2332,15 @@ pub fn candidates(conn: &Connection, args: &Value) -> Result<Value, String> {
         .get("mech")
         .and_then(Value::as_str)
         .map(str::to_uppercase);
+    if let Some(m) = mech.as_deref().filter(|m| {
+        !["C1", "C2", "C3", "C4", "C5", "C6"]
+            .iter()
+            .any(|p| m.starts_with(p))
+    }) {
+        return Err(format!(
+            "mech {m} не из «Вызовов» (C1–C6); K1, K2 — это direction: \"code\""
+        ));
+    }
     let needle = args
         .get("contains")
         .and_then(Value::as_str)
@@ -2349,11 +2359,24 @@ pub fn candidates(conn: &Connection, args: &Value) -> Result<Value, String> {
         {
             continue;
         }
-        if needle
-            .as_ref()
-            .is_some_and(|nd| !r["rec"].to_string().to_lowercase().contains(nd))
-        {
-            continue;
+        // по значениям символов и контекстов, а не по JSON целиком: иначе
+        // «conf» или «parent» совпадают с именами полей у всех записей
+        if let Some(nd) = &needle {
+            let rec = &r["rec"];
+            let hit = ["A", "B", "K", "P", "Q", "parent", "key", "value"]
+                .iter()
+                .filter_map(|k| rec[k].as_str())
+                .chain(
+                    rec["wrappers"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+                .any(|v| v.to_lowercase().contains(nd.as_str()));
+            if !hit {
+                continue;
+            }
         }
         let weak = m == "C3-similar";
         rows.push(json!([r["rank"], r["score"], m, r["rec"], weak]));
@@ -2577,6 +2600,19 @@ mod tests {
         assert_eq!(v["experimental"], true);
         assert_eq!(v["outdated"], false);
         assert!(v["total"].as_u64().unwrap() >= 1, "{v:#}");
+        let чужой = candidates(&c, &json!({"mech": "K1"})).unwrap_err();
+        assert!(
+            чужой.contains("direction"),
+            "механизм другого направления — отказ: {чужой}"
+        );
+        let поле = candidates(&c, &json!({"contains": "relations"})).unwrap();
+        assert_eq!(поле["total"], 0, "имя поля JSON — не совпадение");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            doc.get("members").is_none(),
+            "все находки — только в --dump"
+        );
+        assert_eq!(doc["summary"]["read_errors"], 0);
         c.execute("UPDATE index_meta SET value='2' WHERE key='built_at'", [])
             .unwrap();
         assert_eq!(candidates(&c, &json!({})).unwrap()["outdated"], true);

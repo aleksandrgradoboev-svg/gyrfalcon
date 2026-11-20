@@ -555,6 +555,15 @@ pub fn list(profile: Profile) -> Vec<&'static Tool> {
     list_with(profile, experimental_on())
 }
 
+/// `practice_candidates`: направление выбирает файл кандидатов.
+fn practice_candidates(conn: &Connection, args: &Value) -> Result<Value, String> {
+    match args.get("direction").and_then(Value::as_str) {
+        None | Some("code") => crate::practice_code::candidates(conn, args),
+        Some("calls") => crate::practice_calls::candidates(conn, args),
+        Some(d) => Err(format!("direction: допустимо code или calls, а не {d}")),
+    }
+}
+
 /// Выполнить инструмент. `Err` — текст для агента, а не паника.
 pub fn call(
     conn: &Connection,
@@ -570,11 +579,7 @@ pub fn call(
             ));
         }
         return match name {
-            "practice_candidates" => match args.get("direction").and_then(Value::as_str) {
-                None | Some("code") => crate::practice_code::candidates(conn, args),
-                Some("calls") => crate::practice_calls::candidates(conn, args),
-                Some(d) => Err(format!("direction: допустимо code или calls, а не {d}")),
-            },
+            "practice_candidates" => practice_candidates(conn, args),
             _ => Err(format!("нет такого инструмента: {name}")),
         };
     }
@@ -4045,6 +4050,29 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         let e = call(&c, Profile::All, "practice_candidates", &json!({})).unwrap_err();
         assert!(e.contains("--experimental"), "{e}");
+    }
+
+    #[test]
+    fn кандидаты_практик_по_направлению() {
+        // Индекс без файла: каждое направление отвечает своим отказом —
+        // значит, вызов ушёл в свой модуль.
+        let c = Connection::open_in_memory().unwrap();
+        let e = practice_candidates(&c, &json!({"direction": "calls"})).unwrap_err();
+        assert!(e.contains("индекс без файла"), "{e}");
+        let e = practice_candidates(&c, &json!({"direction": "x"})).unwrap_err();
+        assert!(e.contains("code или calls"), "{e}");
+        let dir = std::env::temp_dir().join("gyrfalcon-tools-practice-direction");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t-index.db");
+        let c = Connection::open(&db).unwrap();
+        let e = practice_candidates(&c, &json!({})).unwrap_err();
+        assert!(
+            e.contains("mine-code"),
+            "по умолчанию — «Конструкции кода»: {e}"
+        );
+        let e = practice_candidates(&c, &json!({"direction": "calls"})).unwrap_err();
+        assert!(e.contains("mine-calls"), "{e}");
     }
 
     #[test]
