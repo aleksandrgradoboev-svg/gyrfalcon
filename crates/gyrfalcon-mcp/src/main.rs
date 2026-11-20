@@ -124,6 +124,10 @@ fn print_help() {
   practices mine-code --db <индекс> [--out <файл.json>]
                       ЭКСПЕРИМЕНТАЛЬНО: кандидаты практик «Конструкции кода» по всей
                       конфигурации; файл рядом с индексом читает practice_candidates
+  practices mine-calls --db <индекс> [--out <файл.json>] [--dump <каталог>]
+                      ЭКСПЕРИМЕНТАЛЬНО: кандидаты практик «Вызовы и связки» (C1–C6 и ранг);
+                      файл рядом с индексом читает practice_candidates(direction=calls);
+                      --dump — промежуточные jsonl в форме пилота, для сверки
   practices preview --db <индекс> --project <имя> [--depth quick|full] [--out <report.json>]
                       проверить полный корпус и кандидатов без изменения профиля
   practices accept --db <индекс> --project <имя> --id <id> --sample <N> --matches <N>
@@ -166,6 +170,7 @@ fn cmd_practices(args: &[String]) -> Result<(), String> {
     let mut depth = None;
     let mut reviewer = None;
     let mut reason = None;
+    let mut dump = None;
     let mut i = 1;
     while i < args.len() {
         let flag = &args[i];
@@ -192,6 +197,7 @@ fn cmd_practices(args: &[String]) -> Result<(), String> {
             "--depth" => depth = Some(value),
             "--reviewer" => reviewer = Some(value),
             "--reason" => reason = Some(value),
+            "--dump" => dump = Some(value),
             _ => return Err(format!("неизвестная опция practices: {flag}")),
         }
     }
@@ -206,6 +212,21 @@ fn cmd_practices(args: &[String]) -> Result<(), String> {
             let (path, summary) = gyrfalcon_mcp::practice_code::mine_to_file(
                 std::path::Path::new(&db),
                 out.as_deref().map(std::path::Path::new),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "out": path.display().to_string(), "summary": summary
+                }))
+                .map_err(|e| e.to_string())?
+            );
+        }
+        "mine-calls" => {
+            let db = db.ok_or("practices mine-calls требует --db")?;
+            let (path, summary) = gyrfalcon_mcp::practice_calls::mine_to_file(
+                std::path::Path::new(&db),
+                out.as_deref().map(std::path::Path::new),
+                dump.as_deref().map(std::path::Path::new),
             )?;
             println!(
                 "{}",
