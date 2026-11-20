@@ -371,6 +371,22 @@ pub fn context() -> Result<&'static PlatformContext, String> {
         .map_err(Clone::clone)
 }
 
+/// Имена методов глобального контекста — как написаны в справке (русские),
+/// по страницам `objects/Global context/`. Нужны добыче практик «Вызовы»
+/// (механизм C3: у какого платформенного метода есть более частая замена).
+pub fn global_context_methods() -> Result<Vec<String>, String> {
+    let catalog = CATALOG
+        .get_or_init(load_catalog)
+        .as_ref()
+        .map_err(Clone::clone)?;
+    Ok(catalog
+        .items
+        .iter()
+        .filter(|i| i.kind == "method" && i.path.starts_with("objects/Global context/"))
+        .map(|i| i.name.clone())
+        .collect())
+}
+
 #[cfg(test)]
 pub(crate) fn context_from_pages(pages: &[(&str, &str)]) -> PlatformContext {
     let items: Vec<Item> = pages

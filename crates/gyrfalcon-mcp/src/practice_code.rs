@@ -148,7 +148,7 @@ const GRAMMAR_NAMES: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Str,
     Num,
     Date,
@@ -157,15 +157,15 @@ enum Kind {
 }
 
 #[derive(Debug, Clone)]
-struct Tok {
-    kind: Kind,
-    text: String,
+pub(crate) struct Tok {
+    pub(crate) kind: Kind,
+    pub(crate) text: String,
     /// Нижний регистр — только у идентификаторов.
-    low: String,
+    pub(crate) low: String,
 }
 
 impl Tok {
-    fn kw(&self) -> Option<&'static str> {
+    pub(crate) fn kw(&self) -> Option<&'static str> {
         if self.kind == Kind::Id {
             kw_map().get(&self.low).copied()
         } else {
@@ -230,7 +230,7 @@ fn str_body(c: &[char], mut j: usize) -> usize {
 /// Лексемы — те же, что у регулярного разборщика пилота, в том же порядке
 /// альтернатив: строка, продолжение многострочной строки (`|` в начале
 /// строки), число, дата, идентификатор, знак. Прочее пропускается.
-fn tokens(text: &str) -> Vec<Tok> {
+pub(crate) fn tokens(text: &str) -> Vec<Tok> {
     let c: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -457,7 +457,7 @@ pub fn parse(body: &str, params: &HashSet<String>) -> Parsed {
 
 /// Параметры метода из строки индекса `(Знач А, Б = 1)` → имена в нижнем
 /// регистре.
-fn param_names(params: Option<&str>) -> HashSet<String> {
+pub(crate) fn param_names(params: Option<&str>) -> HashSet<String> {
     let s = params.unwrap_or("").trim_matches(|c| c == '(' || c == ')');
     let mut out = HashSet::new();
     for p in s.split(',') {
@@ -478,7 +478,7 @@ fn param_names(params: Option<&str>) -> HashSet<String> {
 // ---------------------------------------------------------------- корпус
 
 /// Привести переводы строк к `\n`, считая одиночный `\r` переводом строки.
-fn newlines(text: &str) -> String {
+pub(crate) fn newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -889,7 +889,7 @@ pub fn sidecar(db: &Path) -> PathBuf {
     db.with_file_name(format!("{stem}.practices-code.json"))
 }
 
-fn meta(conn: &Connection, key: &str) -> Option<String> {
+pub(crate) fn meta(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| {
         r.get(0)
     })
@@ -939,8 +939,12 @@ pub fn schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "mech": {"type": "string", "enum": ["K1", "K2"],
-                "description": "K1 — присваивания, которых избегают в контексте; K2 — операторы грамматики"},
+            "direction": {"type": "string", "enum": ["code", "calls"], "default": "code",
+                "description": "code — «Конструкции кода»; calls — «Вызовы и связки»"},
+            "mech": {"type": "string",
+                "description": "code: K1 — присваивания, которых избегают в контексте; K2 — операторы \
+                    грамматики. calls: C1 связки, C2 контекст, C3 вытеснение, C4 форма аргумента, \
+                    C5 граф, C6 склейка/вложенность (префикс: C2 — все C2-*)"},
             "contains": {"type": "string",
                 "description": "фильтр по символу или контексту, без учёта регистра (например ПриЗаписи)"},
             "limit": {"type": "integer", "default": 50}
